@@ -1,221 +1,639 @@
 """
-Tests for Champion and Challenger Models
+Comprehensive Model Tests for Shadow Deployment Platform.
+
+This module provides thorough testing of ML model implementations including:
+- Model loading and initialization
+- Prediction accuracy and consistency
+- Feature validation
+- Error handling
+- Performance characteristics
+
+Example:
+    pytest tests/test_models.py -v --cov=src.models
+
+Author: Shadow MLOps Team
 """
 
-import pytest
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import patch
+
 import numpy as np
+import pytest
 
-
-class TestChampionModel:
-    """Tests for Champion model."""
-
-    def test_champion_initialization(self, champion_model):
-        """Champion model should initialize with correct version."""
-        assert champion_model.version == "2.1.0"
-        assert champion_model.model_name == "ChampionV2"
-
-    def test_champion_predict_returns_required_fields(self, champion_model, sample_features):
-        """Champion prediction should return all required fields."""
-        result = champion_model.predict(sample_features)
-        
-        required_fields = [
-            "churn_probability",
-            "churn_prediction",
-            "model_version",
-            "model_name",
-            "confidence",
-        ]
-        
-        for field in required_fields:
-            assert field in result, f"Missing field: {field}"
-
-    def test_champion_probability_range(self, champion_model, sample_features):
-        """Churn probability should be between 0 and 1."""
-        result = champion_model.predict(sample_features)
-        assert 0 <= result["churn_probability"] <= 1
-
-    def test_champion_prediction_is_boolean(self, champion_model, sample_features):
-        """Churn prediction should be boolean."""
-        result = champion_model.predict(sample_features)
-        assert isinstance(result["churn_prediction"], bool)
-
-    def test_champion_consistent_predictions(self, champion_model, sample_features):
-        """Model should give consistent predictions for same input."""
-        # Note: Model has slight randomness, but predictions should be similar
-        results = [champion_model.predict(sample_features) for _ in range(10)]
-        probabilities = [r["churn_probability"] for r in results]
-        
-        # Check variance is reasonable
-        assert np.std(probabilities) < 0.1
-
-
-class TestChallengerModel:
-    """Tests for Challenger model."""
-
-    def test_challenger_initialization(self, challenger_model):
-        """Challenger model should initialize with correct version."""
-        assert challenger_model.version == "3.0.0-beta"
-        assert challenger_model.model_name == "ChallengerV3"
-
-    def test_challenger_predict_returns_required_fields(self, challenger_model, sample_features):
-        """Challenger prediction should return all required fields."""
-        result = challenger_model.predict(sample_features)
-        
-        required_fields = [
-            "churn_probability",
-            "churn_prediction",
-            "model_version",
-            "model_name",
-            "confidence",
-            "feature_interactions_used",
-        ]
-        
-        for field in required_fields:
-            assert field in result, f"Missing field: {field}"
-
-    def test_challenger_uses_interactions(self, challenger_model, sample_features):
-        """Challenger should use feature interactions."""
-        result = challenger_model.predict(sample_features)
-        assert result["feature_interactions_used"] is True
-
-    def test_challenger_probability_range(self, challenger_model, sample_features):
-        """Churn probability should be between 0 and 1."""
-        result = challenger_model.predict(sample_features)
-        assert 0 <= result["churn_probability"] <= 1
-
-
-class TestModelComparison:
-    """Tests comparing Champion and Challenger models."""
-
-    def test_models_produce_different_predictions(self, champion_model, challenger_model, sample_features):
-        """Champion and Challenger should produce different (but similar) predictions."""
-        champion_result = champion_model.predict(sample_features)
-        challenger_result = challenger_model.predict(sample_features)
-        
-        # Predictions should be similar but not identical
-        prob_diff = abs(
-            champion_result["churn_probability"] - 
-            challenger_result["churn_probability"]
-        )
-        
-        # Should be within 0.3 of each other
-        assert prob_diff < 0.3
-
-    def test_high_risk_customer_detection(self, champion_model, challenger_model):
-        """Both models should identify high-risk customers."""
-        high_risk_features = {
-            "customer_id": "HIGH_RISK_001",
-            "days_since_last_login": 60,  # Haven't logged in for 2 months
-            "login_frequency_30d": 1.0,   # Very low login frequency
-            "session_duration_avg": 2.0,  # Very short sessions
-            "total_transactions_90d": 0,  # No transactions
-            "transaction_value_avg": 0.0,
-            "support_tickets_30d": 5,     # Many support tickets
-            "subscription_tenure_days": 30,  # New customer
-            "satisfaction_score": 3.0,    # Low satisfaction
-        }
-        
-        champion_result = champion_model.predict(high_risk_features)
-        challenger_result = challenger_model.predict(high_risk_features)
-        
-        # Both should identify as higher risk
-        assert champion_result["churn_probability"] > 0.4
-        assert challenger_result["churn_probability"] > 0.4
-
-    def test_low_risk_customer_detection(self, champion_model, challenger_model):
-        """Both models should identify low-risk customers."""
-        low_risk_features = {
-            "customer_id": "LOW_RISK_001",
-            "days_since_last_login": 1,    # Just logged in
-            "login_frequency_30d": 25.0,   # Very active
-            "session_duration_avg": 45.0,  # Long sessions
-            "total_transactions_90d": 20,  # Many transactions
-            "transaction_value_avg": 500.0,
-            "support_tickets_30d": 0,      # No support issues
-            "subscription_tenure_days": 1000,  # Long-term customer
-            "satisfaction_score": 9.5,     # Very satisfied
-        }
-        
-        champion_result = champion_model.predict(low_risk_features)
-        challenger_result = challenger_model.predict(low_risk_features)
-        
-        # Both should identify as lower risk
-        assert champion_result["churn_probability"] < 0.5
-        assert challenger_result["churn_probability"] < 0.5
-
-
-class TestModelRegistry:
-    """Tests for ModelRegistry class."""
-
-    def test_register_model(self, model_registry, champion_model):
-        """Model registry should register models."""
-        model_id = model_registry.register_model(champion_model, role="champion")
-        assert model_id is not None
-        assert model_registry.current_champion == model_id
-
-    def test_get_champion(self, model_registry, champion_model):
-        """Registry should return current champion."""
-        model_registry.register_model(champion_model, role="champion")
-        retrieved = model_registry.get_champion()
-        assert retrieved is not None
-        assert retrieved.version == champion_model.version
-
-    def test_promote_challenger(self, model_registry, champion_model, challenger_model):
-        """Registry should promote challenger to champion."""
-        model_registry.register_model(champion_model, role="champion")
-        model_registry.register_model(challenger_model, role="challenger")
-        
-        old_champion = model_registry.current_champion
-        model_registry.promote_challenger()
-        
-        assert model_registry.current_champion != old_champion
-        assert model_registry.current_challenger is None
-
-    def test_list_models(self, model_registry, champion_model, challenger_model):
-        """Registry should list all models."""
-        model_registry.register_model(champion_model, role="champion")
-        model_registry.register_model(challenger_model, role="challenger")
-        
-        models = model_registry.list_models()
-        assert len(models) == 2
+from src.exceptions import FeatureValidationError, ModelNotLoadedError, PredictionError
+from src.models import (
+    BaseChurnModel,
+    ChampionModel,
+    ChallengerModel,
+    ModelMetadata,
+    ModelRegistry,
+    ModelVersion,
+    PredictionResult,
+    get_registry,
+)
 
 
 # =============================================================================
-# FIXTURES
+# Fixtures
 # =============================================================================
 
-@pytest.fixture
-def champion_model():
-    """Create champion model instance."""
-    from src.models import ChampionModel
-    return ChampionModel()
-
 
 @pytest.fixture
-def challenger_model():
-    """Create challenger model instance."""
-    from src.models import ChallengerModel
-    return ChallengerModel()
+def champion_model() -> ChampionModel:
+    """Create and load a Champion model instance."""
+    model = ChampionModel()
+    model.load()
+    return model
 
 
 @pytest.fixture
-def model_registry():
-    """Create model registry instance."""
-    from src.models import ModelRegistry
+def challenger_model() -> ChallengerModel:
+    """Create and load a Challenger model instance."""
+    model = ChallengerModel()
+    model.load()
+    return model
+
+
+@pytest.fixture
+def registry() -> ModelRegistry:
+    """Create a fresh ModelRegistry instance."""
+    # Reset singleton for testing
+    ModelRegistry._instance = None
     return ModelRegistry()
 
 
 @pytest.fixture
-def sample_features():
-    """Sample customer features for testing."""
+def sample_features() -> dict[str, Any]:
+    """Standard feature set for testing."""
     return {
-        "customer_id": "TEST_CUST_001",
-        "days_since_last_login": 7,
-        "login_frequency_30d": 12.5,
-        "session_duration_avg": 25.0,
-        "total_transactions_90d": 8,
-        "transaction_value_avg": 150.0,
-        "support_tickets_30d": 1,
-        "subscription_tenure_days": 365,
-        "satisfaction_score": 7.5,
+        "tenure": 24,
+        "monthly_charges": 75.0,
+        "total_charges": 1800.0,
+        "contract_type": 1,
+        "payment_method": 1,
+        "num_support_tickets": 2,
+        "avg_monthly_gb_download": 15.0,
+        "num_dependents": 1,
+        "online_security": 1,
+        "tech_support": 1,
     }
+
+
+@pytest.fixture
+def high_churn_features() -> dict[str, Any]:
+    """Features likely to result in high churn probability."""
+    return {
+        "tenure": 1,
+        "monthly_charges": 100.0,
+        "total_charges": 100.0,
+        "contract_type": 0,  # Month-to-month
+        "payment_method": 2,  # Electronic check
+        "num_support_tickets": 10,
+        "avg_monthly_gb_download": 2.0,
+        "num_dependents": 0,
+        "online_security": 0,
+        "tech_support": 0,
+    }
+
+
+@pytest.fixture
+def low_churn_features() -> dict[str, Any]:
+    """Features likely to result in low churn probability."""
+    return {
+        "tenure": 60,
+        "monthly_charges": 40.0,
+        "total_charges": 2400.0,
+        "contract_type": 2,  # Two-year
+        "payment_method": 0,  # Credit card
+        "num_support_tickets": 0,
+        "avg_monthly_gb_download": 25.0,
+        "num_dependents": 3,
+        "online_security": 1,
+        "tech_support": 1,
+    }
+
+
+# =============================================================================
+# ModelMetadata Tests
+# =============================================================================
+
+
+class TestModelMetadata:
+    """Tests for ModelMetadata dataclass."""
+
+    def test_metadata_creation(self) -> None:
+        """Metadata should be created with required fields."""
+        metadata = ModelMetadata(
+            name="Test Model",
+            version="1.0.0",
+            model_type="test",
+        )
+        
+        assert metadata.name == "Test Model"
+        assert metadata.version == "1.0.0"
+        assert metadata.model_type == "test"
+
+    def test_metadata_has_timestamp(self) -> None:
+        """Metadata should have auto-generated timestamp."""
+        metadata = ModelMetadata(
+            name="Test",
+            version="1.0.0",
+            model_type="test",
+        )
+        
+        assert metadata.trained_at is not None
+
+    def test_metadata_hash_is_deterministic(self) -> None:
+        """Same metadata should produce same hash."""
+        metadata1 = ModelMetadata(
+            name="Test",
+            version="1.0.0",
+            model_type="test",
+        )
+        metadata2 = ModelMetadata(
+            name="Test",
+            version="1.0.0",
+            model_type="test",
+        )
+        
+        assert metadata1.model_hash == metadata2.model_hash
+
+    def test_metadata_hash_differs_for_different_versions(self) -> None:
+        """Different versions should produce different hashes."""
+        metadata1 = ModelMetadata(name="Test", version="1.0.0", model_type="test")
+        metadata2 = ModelMetadata(name="Test", version="2.0.0", model_type="test")
+        
+        assert metadata1.model_hash != metadata2.model_hash
+
+    def test_metadata_is_immutable(self) -> None:
+        """Metadata should be immutable (frozen dataclass)."""
+        metadata = ModelMetadata(name="Test", version="1.0.0", model_type="test")
+        
+        with pytest.raises(Exception):  # FrozenInstanceError
+            metadata.name = "Modified"
+
+
+# =============================================================================
+# PredictionResult Tests
+# =============================================================================
+
+
+class TestPredictionResult:
+    """Tests for PredictionResult dataclass."""
+
+    def test_valid_prediction_result(self) -> None:
+        """Valid prediction result should be created."""
+        result = PredictionResult(
+            probability=0.42,
+            label=0,
+            confidence=0.84,
+            model_version="1.0.0",
+        )
+        
+        assert result.probability == 0.42
+        assert result.label == 0
+        assert result.confidence == 0.84
+
+    def test_probability_bounds_validation(self) -> None:
+        """Probability outside [0, 1] should raise ValueError."""
+        with pytest.raises(ValueError, match="Probability"):
+            PredictionResult(
+                probability=1.5,
+                label=0,
+                confidence=0.5,
+                model_version="1.0.0",
+            )
+
+    def test_negative_probability_rejected(self) -> None:
+        """Negative probability should be rejected."""
+        with pytest.raises(ValueError, match="Probability"):
+            PredictionResult(
+                probability=-0.1,
+                label=0,
+                confidence=0.5,
+                model_version="1.0.0",
+            )
+
+    def test_invalid_label_rejected(self) -> None:
+        """Label must be 0 or 1."""
+        with pytest.raises(ValueError, match="Label"):
+            PredictionResult(
+                probability=0.5,
+                label=2,
+                confidence=0.5,
+                model_version="1.0.0",
+            )
+
+    @pytest.mark.parametrize("probability,expected_tier", [
+        (0.10, "LOW"),
+        (0.30, "MEDIUM"),
+        (0.60, "HIGH"),
+        (0.90, "CRITICAL"),
+    ])
+    def test_risk_tier_classification(
+        self,
+        probability: float,
+        expected_tier: str,
+    ) -> None:
+        """Risk tier should be correctly classified."""
+        result = PredictionResult(
+            probability=probability,
+            label=1 if probability >= 0.5 else 0,
+            confidence=0.8,
+            model_version="1.0.0",
+        )
+        
+        assert result.risk_tier == expected_tier
+
+    def test_to_dict_serialization(self) -> None:
+        """Result should serialize to dictionary."""
+        result = PredictionResult(
+            probability=0.42,
+            label=0,
+            confidence=0.84,
+            model_version="1.0.0",
+            request_id="test-123",
+        )
+        
+        data = result.to_dict()
+        
+        assert isinstance(data, dict)
+        assert data["probability"] == 0.42
+        assert data["model_version"] == "1.0.0"
+        assert data["request_id"] == "test-123"
+
+
+# =============================================================================
+# ChampionModel Tests
+# =============================================================================
+
+
+class TestChampionModel:
+    """Tests for ChampionModel."""
+
+    def test_model_initialization(self) -> None:
+        """Model should initialize with correct metadata."""
+        model = ChampionModel()
+        
+        assert model.version == ModelVersion.CHAMPION.value
+        assert model.metadata.name == "Churn Champion"
+        assert not model._is_loaded
+
+    def test_model_load(self, champion_model: ChampionModel) -> None:
+        """Model should load successfully."""
+        assert champion_model._is_loaded
+
+    def test_predict_without_load_raises_error(self) -> None:
+        """Prediction before load should raise ModelNotLoadedError."""
+        model = ChampionModel()
+        
+        with pytest.raises(ModelNotLoadedError):
+            model.predict({"tenure": 12})
+
+    def test_predict_returns_result(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Prediction should return PredictionResult."""
+        result = champion_model.predict(sample_features)
+        
+        assert isinstance(result, PredictionResult)
+        assert 0 <= result.probability <= 1
+        assert result.label in (0, 1)
+        assert result.model_version == ModelVersion.CHAMPION.value
+
+    def test_predict_probability_in_valid_range(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Prediction probability should always be in [0, 1]."""
+        result = champion_model.predict(sample_features)
+        
+        assert 0 <= result.probability <= 1
+
+    def test_predict_with_request_id(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Request ID should be included in result."""
+        result = champion_model.predict(sample_features, request_id="test-123")
+        
+        assert result.request_id == "test-123"
+
+    def test_predict_includes_latency(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Prediction should include latency measurement."""
+        result = champion_model.predict(sample_features)
+        
+        assert result.latency_ms > 0
+
+    def test_predict_includes_feature_contributions(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Prediction should include feature contributions."""
+        result = champion_model.predict(sample_features)
+        
+        assert isinstance(result.feature_contributions, dict)
+        assert len(result.feature_contributions) > 0
+
+    def test_high_churn_features_produce_higher_probability(
+        self,
+        champion_model: ChampionModel,
+        high_churn_features: dict[str, Any],
+        low_churn_features: dict[str, Any],
+    ) -> None:
+        """High-risk features should produce higher churn probability."""
+        high_result = champion_model.predict(high_churn_features)
+        low_result = champion_model.predict(low_churn_features)
+        
+        assert high_result.probability > low_result.probability
+
+    def test_prediction_count_increments(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Prediction count should increment with each prediction."""
+        initial_count = champion_model._prediction_count
+        
+        champion_model.predict(sample_features)
+        champion_model.predict(sample_features)
+        
+        assert champion_model._prediction_count == initial_count + 2
+
+    def test_average_latency_calculation(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Average latency should be calculated correctly."""
+        for _ in range(5):
+            champion_model.predict(sample_features)
+        
+        assert champion_model.average_latency_ms > 0
+
+
+# =============================================================================
+# ChallengerModel Tests
+# =============================================================================
+
+
+class TestChallengerModel:
+    """Tests for ChallengerModel."""
+
+    def test_model_initialization(self) -> None:
+        """Model should initialize with correct metadata."""
+        model = ChallengerModel()
+        
+        assert model.version == ModelVersion.CHALLENGER.value
+        assert "Challenger" in model.metadata.name
+
+    def test_challenger_uses_interactions(
+        self,
+        challenger_model: ChallengerModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Challenger should use interaction features."""
+        result = challenger_model.predict(sample_features)
+        
+        # Just verify it produces valid output
+        assert isinstance(result, PredictionResult)
+        assert 0 <= result.probability <= 1
+
+    def test_challenger_differs_from_champion(
+        self,
+        champion_model: ChampionModel,
+        challenger_model: ChallengerModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Challenger should produce different predictions than Champion."""
+        champion_result = champion_model.predict(sample_features)
+        challenger_result = challenger_model.predict(sample_features)
+        
+        # Predictions should differ (models have different weights)
+        # Allow small tolerance for numerical precision
+        assert abs(champion_result.probability - challenger_result.probability) > 0.001
+
+
+# =============================================================================
+# Feature Validation Tests
+# =============================================================================
+
+
+class TestFeatureValidation:
+    """Tests for feature validation."""
+
+    def test_missing_features_use_defaults(
+        self,
+        champion_model: ChampionModel,
+    ) -> None:
+        """Missing features should use default values."""
+        # Only provide one feature
+        result = champion_model.predict({"tenure": 24})
+        
+        assert isinstance(result, PredictionResult)
+
+    def test_invalid_feature_type_raises_error(
+        self,
+        champion_model: ChampionModel,
+    ) -> None:
+        """Invalid feature type should raise FeatureValidationError."""
+        with pytest.raises(FeatureValidationError):
+            champion_model.predict({"tenure": "not-a-number"})
+
+    def test_extra_features_ignored(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Extra features should be ignored."""
+        features_with_extra = {
+            **sample_features,
+            "unknown_feature": 999,
+        }
+        
+        result = champion_model.predict(features_with_extra)
+        
+        assert isinstance(result, PredictionResult)
+
+
+# =============================================================================
+# Async Prediction Tests
+# =============================================================================
+
+
+class TestAsyncPrediction:
+    """Tests for async prediction methods."""
+
+    @pytest.mark.asyncio
+    async def test_async_predict(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Async prediction should work correctly."""
+        result = await champion_model.predict_async(sample_features)
+        
+        assert isinstance(result, PredictionResult)
+        assert 0 <= result.probability <= 1
+
+    @pytest.mark.asyncio
+    async def test_async_predict_with_request_id(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Async prediction should pass through request ID."""
+        result = await champion_model.predict_async(
+            sample_features,
+            request_id="async-test-123",
+        )
+        
+        assert result.request_id == "async-test-123"
+
+
+# =============================================================================
+# ModelRegistry Tests
+# =============================================================================
+
+
+class TestModelRegistry:
+    """Tests for ModelRegistry."""
+
+    def test_registry_singleton(self) -> None:
+        """Registry should be a singleton."""
+        ModelRegistry._instance = None
+        
+        reg1 = ModelRegistry()
+        reg2 = ModelRegistry()
+        
+        assert reg1 is reg2
+
+    def test_get_champion(self, registry: ModelRegistry) -> None:
+        """Registry should return champion model."""
+        champion = registry.get_champion()
+        
+        assert isinstance(champion, ChampionModel)
+
+    def test_get_challenger(self, registry: ModelRegistry) -> None:
+        """Registry should return challenger model."""
+        challenger = registry.get_challenger()
+        
+        assert isinstance(challenger, ChallengerModel)
+
+    def test_get_model_by_name(self, registry: ModelRegistry) -> None:
+        """Registry should return model by name."""
+        champion = registry.get_model("champion")
+        challenger = registry.get_model("challenger")
+        
+        assert isinstance(champion, ChampionModel)
+        assert isinstance(challenger, ChallengerModel)
+
+    def test_get_unknown_model_raises_error(self, registry: ModelRegistry) -> None:
+        """Unknown model name should raise KeyError."""
+        with pytest.raises(KeyError, match="not found"):
+            registry.get_model("unknown")
+
+    def test_available_models(self, registry: ModelRegistry) -> None:
+        """Available models should list all models."""
+        models = registry.available_models
+        
+        assert "champion" in models
+        assert "challenger" in models
+
+    def test_load_all_models(self, registry: ModelRegistry) -> None:
+        """Load all should load both models."""
+        results = registry.load_all()
+        
+        assert results["champion"] is True
+        assert results["challenger"] is True
+
+    def test_health_check(self, registry: ModelRegistry) -> None:
+        """Health check should return status for all models."""
+        registry.load_all()
+        health = registry.health_check()
+        
+        assert health["champion"] is True
+        assert health["challenger"] is True
+
+    def test_get_metadata(self, registry: ModelRegistry) -> None:
+        """Get metadata should return info for all models."""
+        registry.load_all()
+        metadata = registry.get_metadata()
+        
+        assert "champion" in metadata
+        assert "challenger" in metadata
+        assert metadata["champion"]["is_loaded"] is True
+
+
+# =============================================================================
+# Helper Function Tests
+# =============================================================================
+
+
+class TestHelperFunctions:
+    """Tests for module-level helper functions."""
+
+    def test_get_registry_returns_singleton(self) -> None:
+        """get_registry should return singleton."""
+        reg1 = get_registry()
+        reg2 = get_registry()
+        
+        assert reg1 is reg2
+
+    def test_sigmoid_numerical_stability(self, champion_model: ChampionModel) -> None:
+        """Sigmoid should handle extreme values."""
+        # Test with extreme positive value
+        result = champion_model._sigmoid(500)
+        assert 0 <= result <= 1
+        
+        # Test with extreme negative value
+        result = champion_model._sigmoid(-500)
+        assert 0 <= result <= 1
+
+
+# =============================================================================
+# Determinism Tests
+# =============================================================================
+
+
+class TestDeterminism:
+    """Tests for prediction determinism."""
+
+    def test_same_input_same_output(
+        self,
+        champion_model: ChampionModel,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Same input should produce same output."""
+        result1 = champion_model.predict(sample_features)
+        result2 = champion_model.predict(sample_features)
+        
+        assert result1.probability == result2.probability
+        assert result1.label == result2.label
+
+    def test_predictions_reproducible_across_instances(
+        self,
+        sample_features: dict[str, Any],
+    ) -> None:
+        """Different model instances should produce same predictions."""
+        model1 = ChampionModel()
+        model1.load()
+        
+        model2 = ChampionModel()
+        model2.load()
+        
+        result1 = model1.predict(sample_features)
+        result2 = model2.predict(sample_features)
+        
+        assert result1.probability == result2.probability

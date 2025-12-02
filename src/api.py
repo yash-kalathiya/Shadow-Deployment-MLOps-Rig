@@ -7,119 +7,399 @@ This FastAPI application implements a shadow deployment pattern where:
 
 The Challenger model's predictions are logged asynchronously for analysis
 without affecting production response times or user experience.
+
+Author: MLOps Team
+Version: 1.0.0
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
+import time
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 import aiofiles
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from src.models import ChampionModel, ChallengerModel
+from src.exceptions import (
+    CircuitBreakerOpenError,
+    ModelNotLoadedError,
+    ModelPredictionError,
+    RateLimitExceededError,
+    ShadowMLOpsError,
+)
+from src.models import ChallengerModel, ChampionModel
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-LOG_DIR = Path("logs")
-SHADOW_LOG_FILE = LOG_DIR / "shadow_logs.json"
-PREDICTION_LOG_FILE = LOG_DIR / "prediction_logs.json"
 
-# Logging configuration
+class Config:
+    """Application configuration with sensible defaults."""
+    
+    APP_NAME: str = "Shadow-MLOps API"
+    APP_VERSION: str = "1.0.0"
+    ENVIRONMENT: str = "development"
+    DEBUG: bool = False
+    
+    # Paths
+    LOG_DIR: Path = Path("logs")
+    SHADOW_LOG_FILE: Path = LOG_DIR / "shadow_logs.json"
+    
+    # Rate limiting
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_REQUESTS: int = 100
+    RATE_LIMIT_WINDOW: int = 60  # seconds
+    
+    # Shadow deployment
+    SHADOW_MODE_ENABLED: bool = True
+    SHADOW_LOG_MAX_ENTRIES: int = 10000
+    
+    # Circuit breaker
+    CIRCUIT_BREAKER_THRESHOLD: int = 5
+    CIRCUIT_BREAKER_TIMEOUT: int = 30  # seconds
+
+
+config = Config()
+
+# Ensure log directory exists
+config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Custom logger with request context
+class RequestContextFilter(logging.Filter):
+    """Add request_id to log records for distributed tracing."""
+    
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = "system"
+        return True
+
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/api.log"),
+        logging.FileHandler(config.LOG_DIR / "api.log"),
     ],
 )
+
 logger = logging.getLogger("shadow_api")
+logger.addFilter(RequestContextFilter())
+
 
 # =============================================================================
-# REQUEST/RESPONSE MODELS
+# ENUMS
+# =============================================================================
+
+
+class RiskCategory(str, Enum):
+    """Churn risk categories with clear thresholds."""
+    
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class ModelRole(str, Enum):
+    """Model roles in shadow deployment."""
+    
+    CHAMPION = "champion"
+    CHALLENGER = "challenger"
+
+
+# =============================================================================
+# REQUEST/RESPONSE MODELS (Pydantic v2)
 # =============================================================================
 
 
 class CustomerFeatures(BaseModel):
-    """Input features for churn prediction."""
-
-    customer_id: str = Field(..., description="Unique customer identifier")
-    days_since_last_login: int = Field(..., ge=0, description="Days since last login")
-    login_frequency_30d: float = Field(..., ge=0, description="Login frequency in last 30 days")
-    session_duration_avg: float = Field(..., ge=0, description="Average session duration in minutes")
-    total_transactions_90d: int = Field(..., ge=0, description="Total transactions in last 90 days")
-    transaction_value_avg: float = Field(..., ge=0, description="Average transaction value")
-    support_tickets_30d: int = Field(..., ge=0, description="Support tickets in last 30 days")
-    subscription_tenure_days: int = Field(..., ge=0, description="Days since subscription started")
-    satisfaction_score: float = Field(..., ge=0, le=10, description="Customer satisfaction score")
+    """
+    Input features for churn prediction.
+    
+    All features are validated with realistic bounds to catch input errors early.
+    """
+    
+    customer_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Unique customer identifier",
+        json_schema_extra={"example": "CUST_001234"},
+    )
+    days_since_last_login: int = Field(
+        ...,
+        ge=0,
+        le=3650,
+        description="Days since last login (max 10 years)",
+        json_schema_extra={"example": 7},
+    )
+    login_frequency_30d: float = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Login frequency in last 30 days",
+        json_schema_extra={"example": 12.5},
+    )
+    session_duration_avg: float = Field(
+        ...,
+        ge=0,
+        le=1440,
+        description="Average session duration in minutes (max 24h)",
+        json_schema_extra={"example": 25.0},
+    )
+    total_transactions_90d: int = Field(
+        ...,
+        ge=0,
+        le=10000,
+        description="Total transactions in last 90 days",
+        json_schema_extra={"example": 8},
+    )
+    transaction_value_avg: float = Field(
+        ...,
+        ge=0,
+        le=1000000,
+        description="Average transaction value",
+        json_schema_extra={"example": 150.0},
+    )
+    support_tickets_30d: int = Field(
+        ...,
+        ge=0,
+        le=1000,
+        description="Support tickets in last 30 days",
+        json_schema_extra={"example": 1},
+    )
+    subscription_tenure_days: int = Field(
+        ...,
+        ge=0,
+        le=36500,
+        description="Days since subscription started (max 100 years)",
+        json_schema_extra={"example": 365},
+    )
+    satisfaction_score: float = Field(
+        ...,
+        ge=0,
+        le=10,
+        description="Customer satisfaction score (0-10)",
+        json_schema_extra={"example": 7.5},
+    )
+    
+    @field_validator("customer_id")
+    @classmethod
+    def normalize_customer_id(cls, v: str) -> str:
+        """Normalize customer ID to uppercase."""
+        return v.strip().upper()
+    
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "customer_id": "CUST_001234",
+                    "days_since_last_login": 7,
+                    "login_frequency_30d": 12.5,
+                    "session_duration_avg": 25.0,
+                    "total_transactions_90d": 8,
+                    "transaction_value_avg": 150.0,
+                    "support_tickets_30d": 1,
+                    "subscription_tenure_days": 365,
+                    "satisfaction_score": 7.5,
+                }
+            ]
+        }
+    }
 
 
 class PredictionResponse(BaseModel):
-    """Response from the prediction endpoint."""
-
-    request_id: str = Field(..., description="Unique request identifier")
+    """Prediction response with full traceability."""
+    
+    request_id: str = Field(..., description="Unique request ID for tracing")
     customer_id: str = Field(..., description="Customer identifier")
-    churn_probability: float = Field(..., ge=0, le=1, description="Probability of churn")
+    churn_probability: float = Field(..., ge=0, le=1, description="Churn probability (0-1)")
     churn_prediction: bool = Field(..., description="Binary churn prediction")
-    risk_category: str = Field(..., description="Risk category: low, medium, high")
-    model_version: str = Field(..., description="Champion model version")
-    timestamp: str = Field(..., description="Prediction timestamp")
+    risk_category: RiskCategory = Field(..., description="Risk category")
+    confidence: float = Field(..., ge=0, le=1, description="Model confidence")
+    model_version: str = Field(..., description="Model version")
+    model_name: str = Field(..., description="Model name")
+    timestamp: str = Field(..., description="ISO 8601 timestamp")
+    latency_ms: float = Field(..., description="Prediction latency in ms")
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
-
-    status: str
-    timestamp: str
-    models: Dict[str, str]
-    version: str
+    """Comprehensive health check response."""
+    
+    status: str = Field(..., description="Overall health status")
+    timestamp: str = Field(..., description="Health check timestamp")
+    version: str = Field(..., description="API version")
+    environment: str = Field(..., description="Deployment environment")
+    models: Dict[str, Dict[str, Any]] = Field(..., description="Model status")
+    dependencies: Dict[str, str] = Field(..., description="Dependency health")
 
 
 class BatchPredictionRequest(BaseModel):
-    """Batch prediction request."""
-
-    customers: List[CustomerFeatures]
+    """Batch prediction request with size limits."""
+    
+    customers: List[CustomerFeatures] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="List of customers (max 100)",
+    )
 
 
 class BatchPredictionResponse(BaseModel):
-    """Batch prediction response."""
+    """Batch prediction response with statistics."""
+    
+    request_id: str = Field(..., description="Batch request ID")
+    predictions: List[PredictionResponse] = Field(..., description="Predictions")
+    total_count: int = Field(..., description="Total count")
+    success_count: int = Field(..., description="Successful predictions")
+    failed_count: int = Field(..., description="Failed predictions")
+    processing_time_ms: float = Field(..., description="Total processing time in ms")
 
-    request_id: str
-    predictions: List[PredictionResponse]
-    processing_time_ms: float
+
+class ErrorResponse(BaseModel):
+    """Standardized error response."""
+    
+    error: str = Field(..., description="Error type")
+    code: str = Field(..., description="Error code")
+    message: str = Field(..., description="Human-readable message")
+    details: Optional[Dict[str, Any]] = Field(None, description="Additional details")
+    request_id: Optional[str] = Field(None, description="Request ID")
+    timestamp: str = Field(..., description="Error timestamp")
 
 
 # =============================================================================
-# SHADOW LOGGING
+# RATE LIMITER (Sliding Window Algorithm)
+# =============================================================================
+
+
+class RateLimiter:
+    """
+    Thread-safe sliding window rate limiter.
+    
+    For production with multiple instances, use Redis-based implementation.
+    """
+    
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: Dict[str, List[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+    
+    async def is_allowed(self, client_id: str) -> tuple[bool, int]:
+        """Check if request is allowed. Returns (allowed, remaining/retry_after)."""
+        async with self._lock:
+            now = time.time()
+            window_start = now - self.window_seconds
+            
+            # Remove expired entries
+            self._requests[client_id] = [
+                ts for ts in self._requests[client_id] if ts > window_start
+            ]
+            
+            if len(self._requests[client_id]) >= self.max_requests:
+                oldest = min(self._requests[client_id])
+                retry_after = int(oldest + self.window_seconds - now) + 1
+                return False, retry_after
+            
+            self._requests[client_id].append(now)
+            remaining = self.max_requests - len(self._requests[client_id])
+            return True, remaining
+
+
+# =============================================================================
+# CIRCUIT BREAKER (Fault Tolerance)
+# =============================================================================
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker for fault tolerance.
+    
+    States: CLOSED (normal) -> OPEN (failing) -> HALF_OPEN (testing)
+    """
+    
+    def __init__(self, failure_threshold: int = 5, timeout_seconds: int = 30):
+        self.failure_threshold = failure_threshold
+        self.timeout_seconds = timeout_seconds
+        self._failures: Dict[str, int] = defaultdict(int)
+        self._last_failure: Dict[str, float] = {}
+        self._state: Dict[str, str] = defaultdict(lambda: "CLOSED")
+        self._lock = asyncio.Lock()
+    
+    async def is_open(self, service: str) -> bool:
+        """Check if circuit is open (rejecting requests)."""
+        async with self._lock:
+            if self._state[service] == "OPEN":
+                if time.time() - self._last_failure.get(service, 0) > self.timeout_seconds:
+                    self._state[service] = "HALF_OPEN"
+                    return False
+                return True
+            return False
+    
+    async def record_success(self, service: str) -> None:
+        """Record successful call, reset circuit."""
+        async with self._lock:
+            self._failures[service] = 0
+            self._state[service] = "CLOSED"
+    
+    async def record_failure(self, service: str) -> None:
+        """Record failure, potentially open circuit."""
+        async with self._lock:
+            self._failures[service] += 1
+            self._last_failure[service] = time.time()
+            if self._failures[service] >= self.failure_threshold:
+                self._state[service] = "OPEN"
+    
+    def get_retry_after(self, service: str) -> int:
+        """Get seconds until retry is allowed."""
+        elapsed = time.time() - self._last_failure.get(service, 0)
+        return max(1, int(self.timeout_seconds - elapsed))
+
+
+# =============================================================================
+# SHADOW LOGGER (Async with Buffering)
 # =============================================================================
 
 
 class ShadowLogger:
-    """Asynchronous logger for shadow model predictions."""
-
-    def __init__(self, log_file: Path):
+    """
+    High-performance async shadow logger with buffering.
+    
+    Buffers entries and flushes periodically to minimize I/O overhead.
+    """
+    
+    def __init__(self, log_file: Path, max_entries: int = 10000):
         self.log_file = log_file
+        self.max_entries = max_entries
         self._lock = asyncio.Lock()
-        self._ensure_log_file()
-
-    def _ensure_log_file(self):
-        """Ensure log directory and file exist."""
+        self._buffer: List[Dict[str, Any]] = []
+        self._buffer_size = 50
+        self._ensure_file()
+    
+    def _ensure_file(self) -> None:
+        """Ensure log file exists."""
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         if not self.log_file.exists():
             with open(self.log_file, "w") as f:
                 json.dump([], f)
-
+    
     async def log_shadow_prediction(
         self,
         request_id: str,
@@ -130,107 +410,140 @@ class ShadowLogger:
         latency_champion_ms: float,
         latency_challenger_ms: float,
     ) -> None:
-        """
-        Asynchronously log shadow predictions for comparison analysis.
-
-        Args:
-            request_id: Unique request identifier
-            customer_id: Customer identifier
-            champion_prediction: Champion model prediction result
-            challenger_prediction: Challenger model prediction result
-            features: Input features used for prediction
-            latency_champion_ms: Champion model latency in milliseconds
-            latency_challenger_ms: Challenger model latency in milliseconds
-        """
-        log_entry = {
+        """Log shadow prediction comparison."""
+        entry = {
             "request_id": request_id,
             "customer_id": customer_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "champion": {
                 "prediction": champion_prediction,
-                "latency_ms": latency_champion_ms,
-                "model_version": champion_prediction.get("model_version", "unknown"),
+                "latency_ms": round(latency_champion_ms, 3),
+                "model_version": champion_prediction.get("model_version"),
             },
             "challenger": {
                 "prediction": challenger_prediction,
-                "latency_ms": latency_challenger_ms,
-                "model_version": challenger_prediction.get("model_version", "unknown"),
+                "latency_ms": round(latency_challenger_ms, 3),
+                "model_version": challenger_prediction.get("model_version"),
             },
             "comparison": {
-                "probability_diff": abs(
-                    champion_prediction["churn_probability"]
-                    - challenger_prediction["churn_probability"]
+                "probability_diff": round(
+                    abs(
+                        champion_prediction["churn_probability"]
+                        - challenger_prediction["churn_probability"]
+                    ),
+                    4,
                 ),
-                "prediction_match": champion_prediction["churn_prediction"]
-                == challenger_prediction["churn_prediction"],
+                "prediction_match": (
+                    champion_prediction["churn_prediction"]
+                    == challenger_prediction["churn_prediction"]
+                ),
             },
-            "features": features,
         }
-
+        
         async with self._lock:
-            try:
-                async with aiofiles.open(self.log_file, "r") as f:
-                    content = await f.read()
-                    logs = json.loads(content) if content else []
+            self._buffer.append(entry)
+            if len(self._buffer) >= self._buffer_size:
+                await self._flush()
+    
+    async def _flush(self) -> None:
+        """Flush buffer to file."""
+        if not self._buffer:
+            return
+        
+        try:
+            async with aiofiles.open(self.log_file, "r") as f:
+                content = await f.read()
+                logs = json.loads(content) if content.strip() else []
+            
+            logs.extend(self._buffer)
+            if len(logs) > self.max_entries:
+                logs = logs[-self.max_entries:]
+            
+            async with aiofiles.open(self.log_file, "w") as f:
+                await f.write(json.dumps(logs, indent=2))
+            
+            self._buffer.clear()
+        except Exception as e:
+            logger.error(f"Shadow log flush failed: {e}", extra={"request_id": "system"})
+    
+    async def force_flush(self) -> None:
+        """Force flush all buffered entries."""
+        async with self._lock:
+            await self._flush()
 
-                logs.append(log_entry)
 
-                # Keep only last 10000 entries to prevent unbounded growth
-                if len(logs) > 10000:
-                    logs = logs[-10000:]
+# =============================================================================
+# GLOBAL INSTANCES
+# =============================================================================
 
-                async with aiofiles.open(self.log_file, "w") as f:
-                    await f.write(json.dumps(logs, indent=2))
+rate_limiter = RateLimiter(config.RATE_LIMIT_REQUESTS, config.RATE_LIMIT_WINDOW)
+circuit_breaker = CircuitBreaker(config.CIRCUIT_BREAKER_THRESHOLD, config.CIRCUIT_BREAKER_TIMEOUT)
+shadow_logger: Optional[ShadowLogger] = None
+champion_model: Optional[ChampionModel] = None
+challenger_model: Optional[ChallengerModel] = None
 
-                logger.info(
-                    f"Shadow log recorded: request_id={request_id}, "
-                    f"prediction_match={log_entry['comparison']['prediction_match']}, "
-                    f"prob_diff={log_entry['comparison']['probability_diff']:.4f}"
-                )
 
-            except Exception as e:
-                logger.error(f"Failed to write shadow log: {e}")
+# =============================================================================
+# DEPENDENCIES
+# =============================================================================
+
+
+async def get_client_id(request: Request) -> str:
+    """Extract client ID from request for rate limiting."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def check_rate_limit(request: Request, client_id: str = Depends(get_client_id)) -> None:
+    """Rate limit dependency."""
+    if not config.RATE_LIMIT_ENABLED:
+        return
+    
+    allowed, value = await rate_limiter.is_allowed(client_id)
+    if not allowed:
+        raise RateLimitExceededError(retry_after=value)
+    request.state.rate_limit_remaining = value
+
+
+def get_request_id(request: Request) -> str:
+    """Get or generate request ID for tracing."""
+    return request.headers.get("X-Request-ID", str(uuid.uuid4()))
 
 
 # =============================================================================
 # APPLICATION LIFECYCLE
 # =============================================================================
 
-# Global instances
-shadow_logger: Optional[ShadowLogger] = None
-champion_model: Optional[ChampionModel] = None
-challenger_model: Optional[ChallengerModel] = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager for startup and shutdown events."""
+    """Application startup and shutdown."""
     global shadow_logger, champion_model, challenger_model
-
-    # Startup
-    logger.info("Initializing Shadow Deployment API...")
-
-    # Initialize models
+    
+    logger.info(f"Starting {config.APP_NAME} v{config.APP_VERSION}", extra={"request_id": "startup"})
+    
+    # Load models
     champion_model = ChampionModel()
     challenger_model = ChallengerModel()
-    logger.info(f"Champion Model loaded: v{champion_model.version}")
-    logger.info(f"Challenger Model loaded: v{challenger_model.version}")
-
+    logger.info(
+        f"Models: Champion v{champion_model.version}, Challenger v{challenger_model.version}",
+        extra={"request_id": "startup"},
+    )
+    
     # Initialize shadow logger
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    shadow_logger = ShadowLogger(SHADOW_LOG_FILE)
-    logger.info(f"Shadow logger initialized: {SHADOW_LOG_FILE}")
-
-    logger.info("Shadow Deployment API ready to serve requests")
-
+    shadow_logger = ShadowLogger(config.SHADOW_LOG_FILE, config.SHADOW_LOG_MAX_ENTRIES)
+    
+    logger.info("Ready to serve requests", extra={"request_id": "startup"})
+    
     yield
-
+    
     # Shutdown
-    logger.info("Shutting down Shadow Deployment API...")
-    champion_model = None
-    challenger_model = None
-    shadow_logger = None
-    logger.info("Shutdown complete")
+    logger.info("Shutting down...", extra={"request_id": "shutdown"})
+    if shadow_logger:
+        await shadow_logger.force_flush()
+    logger.info("Shutdown complete", extra={"request_id": "shutdown"})
 
 
 # =============================================================================
@@ -240,38 +553,113 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shadow-MLOps: Churn Prediction API",
     description="""
-    ## Shadow Deployment Pattern for Churn Prediction
+## 🚀 Enterprise Shadow Deployment for ML Models
 
-    This API implements a shadow deployment architecture where:
-    - **Champion Model**: The production model serving real predictions
-    - **Challenger Model**: A shadow model running in parallel for comparison
+This API implements a production-grade shadow deployment pattern for churn prediction.
 
-    ### Key Features
-    - Zero-downtime model comparison
-    - Asynchronous shadow prediction logging
-    - Real-time drift detection readiness
-    - Feast Feature Store integration
+### Architecture
+| Component | Description |
+|-----------|-------------|
+| **Champion Model** | Production model serving real predictions |
+| **Challenger Model** | Shadow model for comparison (async) |
 
-    ### Endpoints
-    - `/predict`: Single customer churn prediction
-    - `/predict/batch`: Batch predictions for multiple customers
-    - `/health`: System health check
-    - `/metrics`: Prometheus-compatible metrics
+### Features
+- ✅ Zero-downtime model comparison
+- ✅ Async shadow prediction logging  
+- ✅ Rate limiting (100 req/min)
+- ✅ Circuit breaker pattern
+- ✅ Request tracing (X-Request-ID)
+- ✅ Prometheus-compatible metrics
+
+### Rate Limits
+Rate limit headers are included in all responses:
+- `X-RateLimit-Limit`: Maximum requests per window
+- `X-RateLimit-Remaining`: Remaining requests
     """,
-    version="1.0.0",
+    version=config.APP_VERSION,
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
+    contact={"name": "MLOps Team", "email": "mlops@example.com"},
+    license_info={"name": "MIT", "url": "https://opensource.org/licenses/MIT"},
 )
 
-# CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-RateLimit-Remaining", "X-RateLimit-Limit", "X-Process-Time-Ms"],
 )
+
+
+# =============================================================================
+# MIDDLEWARE
+# =============================================================================
+
+
+@app.middleware("http")
+async def request_middleware(request: Request, call_next):
+    """Add request tracing and timing."""
+    request_id = get_request_id(request)
+    request.state.request_id = request_id
+    
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = (time.perf_counter() - start) * 1000
+    
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time-Ms"] = f"{elapsed:.2f}"
+    
+    if hasattr(request.state, "rate_limit_remaining"):
+        response.headers["X-RateLimit-Remaining"] = str(request.state.rate_limit_remaining)
+        response.headers["X-RateLimit-Limit"] = str(config.RATE_LIMIT_REQUESTS)
+    
+    logger.info(
+        f"{request.method} {request.url.path} {response.status_code} {elapsed:.1f}ms",
+        extra={"request_id": request_id},
+    )
+    return response
+
+
+# =============================================================================
+# EXCEPTION HANDLERS
+# =============================================================================
+
+
+@app.exception_handler(ShadowMLOpsError)
+async def handle_app_error(request: Request, exc: ShadowMLOpsError):
+    """Handle application-specific errors."""
+    request_id = getattr(request.state, "request_id", "unknown")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.error_code,
+            "code": exc.error_code,
+            "message": exc.message,
+            "details": exc.details,
+            "request_id": request_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception):
+    """Handle unexpected errors."""
+    request_id = getattr(request.state, "request_id", "unknown")
+    logger.error(f"Unexpected error: {exc}", extra={"request_id": request_id}, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "INTERNAL_ERROR",
+            "code": "INTERNAL_ERROR",
+            "message": "An unexpected error occurred",
+            "request_id": request_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 # =============================================================================
@@ -279,14 +667,15 @@ app.add_middleware(
 # =============================================================================
 
 
-def classify_risk(probability: float) -> str:
-    """Classify churn risk based on probability threshold."""
-    if probability < 0.3:
-        return "low"
-    elif probability < 0.7:
-        return "medium"
-    else:
-        return "high"
+def classify_risk(probability: float) -> RiskCategory:
+    """Classify risk based on churn probability."""
+    if probability < 0.25:
+        return RiskCategory.LOW
+    elif probability < 0.50:
+        return RiskCategory.MEDIUM
+    elif probability < 0.75:
+        return RiskCategory.HIGH
+    return RiskCategory.CRITICAL
 
 
 async def run_shadow_prediction(
@@ -296,62 +685,60 @@ async def run_shadow_prediction(
     champion_result: Dict[str, Any],
     champion_latency: float,
 ) -> None:
-    """
-    Run challenger model prediction asynchronously in shadow mode.
-
-    This function runs in the background after the champion prediction
-    is returned to the user, ensuring zero latency impact.
-    """
-    import time
-
-    start_time = time.perf_counter()
-
+    """Run challenger prediction asynchronously."""
+    if not config.SHADOW_MODE_ENABLED or not challenger_model:
+        return
+    
+    start = time.perf_counter()
     try:
-        # Run challenger prediction
-        challenger_result = challenger_model.predict(features)
-        challenger_latency = (time.perf_counter() - start_time) * 1000
-
-        # Log shadow comparison
+        result = challenger_model.predict(features)
+        latency = (time.perf_counter() - start) * 1000
+        
         await shadow_logger.log_shadow_prediction(
-            request_id=request_id,
-            customer_id=customer_id,
-            champion_prediction=champion_result,
-            challenger_prediction=challenger_result,
-            features=features,
-            latency_champion_ms=champion_latency,
-            latency_challenger_ms=challenger_latency,
+            request_id, customer_id, champion_result, result, features, champion_latency, latency
         )
-
+        await circuit_breaker.record_success("challenger")
     except Exception as e:
-        logger.error(f"Shadow prediction failed for request {request_id}: {e}")
+        await circuit_breaker.record_failure("challenger")
+        logger.error(f"Shadow prediction failed: {e}", extra={"request_id": request_id})
 
 
 # =============================================================================
-# API ENDPOINTS
+# ENDPOINTS
 # =============================================================================
 
 
 @app.get("/", include_in_schema=False)
 async def root():
-    """Root endpoint redirect to documentation."""
-    return {"message": "Shadow-MLOps API", "docs": "/docs"}
+    """Root redirect to docs."""
+    return {"service": config.APP_NAME, "version": config.APP_VERSION, "docs": "/docs"}
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """
-    Health check endpoint for load balancer and monitoring.
-
-    Returns the status of all system components including model versions.
-    """
+    """Health check for load balancers and monitoring."""
     return HealthResponse(
         status="healthy",
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        version=config.APP_VERSION,
+        environment=config.ENVIRONMENT,
         models={
-            "champion": f"v{champion_model.version}" if champion_model else "not_loaded",
-            "challenger": f"v{challenger_model.version}" if challenger_model else "not_loaded",
+            "champion": {
+                "version": f"v{champion_model.version}" if champion_model else "unavailable",
+                "name": champion_model.model_name if champion_model else "unknown",
+                "status": "healthy" if champion_model else "unavailable",
+            },
+            "challenger": {
+                "version": f"v{challenger_model.version}" if challenger_model else "unavailable",
+                "name": challenger_model.model_name if challenger_model else "unknown",
+                "status": "healthy" if challenger_model else "unavailable",
+            },
         },
-        version="1.0.0",
+        dependencies={
+            "shadow_logger": "healthy" if shadow_logger else "unavailable",
+            "rate_limiter": "healthy",
+            "circuit_breaker": "healthy",
+        },
     )
 
 
@@ -360,281 +747,173 @@ async def predict(
     request: CustomerFeatures,
     background_tasks: BackgroundTasks,
     req: Request,
+    _: None = Depends(check_rate_limit),
 ) -> PredictionResponse:
     """
     Predict customer churn probability.
-
-    This endpoint:
-    1. Runs the Champion (production) model and returns the result
-    2. Asynchronously runs the Challenger (shadow) model
-    3. Logs both predictions for comparison analysis
-
-    The user only sees the Champion model result, ensuring consistent
-    production behavior while enabling shadow comparison.
-
-    Args:
-        request: Customer features for prediction
-
-    Returns:
-        PredictionResponse: Champion model's churn prediction
+    
+    Returns Champion model result. Challenger runs async in shadow mode.
     """
-    import time
-
-    request_id = str(uuid.uuid4())
+    request_id = getattr(req.state, "request_id", str(uuid.uuid4()))
     features = request.model_dump()
-
-    # Validate models are loaded
-    if not champion_model or not challenger_model:
-        raise HTTPException(
-            status_code=503,
-            detail="Models not initialized. Please retry later.",
-        )
-
-    # Run Champion model (production)
-    start_time = time.perf_counter()
+    
+    if not champion_model:
+        raise ModelNotLoadedError("champion")
+    
+    if await circuit_breaker.is_open("champion"):
+        raise CircuitBreakerOpenError("champion", circuit_breaker.get_retry_after("champion"))
+    
+    start = time.perf_counter()
     try:
-        champion_result = champion_model.predict(features)
-        champion_latency = (time.perf_counter() - start_time) * 1000
+        result = champion_model.predict(features)
+        latency = (time.perf_counter() - start) * 1000
+        await circuit_breaker.record_success("champion")
     except Exception as e:
-        logger.error(f"Champion model prediction failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Prediction failed. Please retry later.",
+        await circuit_breaker.record_failure("champion")
+        raise ModelPredictionError("champion", str(e))
+    
+    # Shadow prediction (async)
+    if challenger_model:
+        background_tasks.add_task(
+            run_shadow_prediction, request_id, request.customer_id, features, result, latency
         )
-
-    # Schedule Challenger model to run asynchronously (shadow mode)
-    background_tasks.add_task(
-        run_shadow_prediction,
-        request_id,
-        request.customer_id,
-        features,
-        champion_result,
-        champion_latency,
-    )
-
-    # Return ONLY the Champion result to the user
-    response = PredictionResponse(
+    
+    return PredictionResponse(
         request_id=request_id,
         customer_id=request.customer_id,
-        churn_probability=champion_result["churn_probability"],
-        churn_prediction=champion_result["churn_prediction"],
-        risk_category=classify_risk(champion_result["churn_probability"]),
+        churn_probability=result["churn_probability"],
+        churn_prediction=result["churn_prediction"],
+        risk_category=classify_risk(result["churn_probability"]),
+        confidence=result.get("confidence", 0.0),
         model_version=f"v{champion_model.version}",
-        timestamp=datetime.utcnow().isoformat(),
+        model_name=champion_model.model_name,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        latency_ms=round(latency, 3),
     )
-
-    logger.info(
-        f"Prediction served: request_id={request_id}, "
-        f"customer_id={request.customer_id}, "
-        f"churn_prob={champion_result['churn_probability']:.4f}"
-    )
-
-    return response
 
 
 @app.post("/predict/batch", response_model=BatchPredictionResponse, tags=["Predictions"])
 async def predict_batch(
     request: BatchPredictionRequest,
     background_tasks: BackgroundTasks,
+    req: Request,
+    _: None = Depends(check_rate_limit),
 ) -> BatchPredictionResponse:
-    """
-    Batch prediction endpoint for multiple customers.
-
-    Processes multiple customers in a single request while maintaining
-    shadow deployment logging for each individual prediction.
-
-    Args:
-        request: List of customer features
-
-    Returns:
-        BatchPredictionResponse: Predictions for all customers
-    """
-    import time
-
-    batch_request_id = str(uuid.uuid4())
-    start_time = time.perf_counter()
-
-    predictions = []
-
+    """Batch prediction for multiple customers (max 100)."""
+    batch_id = getattr(req.state, "request_id", str(uuid.uuid4()))
+    start = time.perf_counter()
+    
+    predictions, failed = [], 0
+    
     for customer in request.customers:
-        request_id = str(uuid.uuid4())
-        features = customer.model_dump()
-
-        # Champion prediction
-        pred_start = time.perf_counter()
-        champion_result = champion_model.predict(features)
-        champion_latency = (time.perf_counter() - pred_start) * 1000
-
-        # Schedule shadow prediction
-        background_tasks.add_task(
-            run_shadow_prediction,
-            request_id,
-            customer.customer_id,
-            features,
-            champion_result,
-            champion_latency,
-        )
-
-        predictions.append(
-            PredictionResponse(
-                request_id=request_id,
+        try:
+            pred_start = time.perf_counter()
+            result = champion_model.predict(customer.model_dump())
+            latency = (time.perf_counter() - pred_start) * 1000
+            
+            predictions.append(PredictionResponse(
+                request_id=str(uuid.uuid4()),
                 customer_id=customer.customer_id,
-                churn_probability=champion_result["churn_probability"],
-                churn_prediction=champion_result["churn_prediction"],
-                risk_category=classify_risk(champion_result["churn_probability"]),
+                churn_probability=result["churn_probability"],
+                churn_prediction=result["churn_prediction"],
+                risk_category=classify_risk(result["churn_probability"]),
+                confidence=result.get("confidence", 0.0),
                 model_version=f"v{champion_model.version}",
-                timestamp=datetime.utcnow().isoformat(),
-            )
-        )
-
-    processing_time = (time.perf_counter() - start_time) * 1000
-
-    logger.info(
-        f"Batch prediction served: batch_id={batch_request_id}, "
-        f"count={len(predictions)}, "
-        f"processing_time_ms={processing_time:.2f}"
-    )
-
+                model_name=champion_model.model_name,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                latency_ms=round(latency, 3),
+            ))
+        except Exception:
+            failed += 1
+    
     return BatchPredictionResponse(
-        request_id=batch_request_id,
+        request_id=batch_id,
         predictions=predictions,
-        processing_time_ms=processing_time,
+        total_count=len(request.customers),
+        success_count=len(predictions),
+        failed_count=failed,
+        processing_time_ms=round((time.perf_counter() - start) * 1000, 3),
     )
 
 
 @app.get("/metrics", tags=["System"])
 async def metrics():
-    """
-    Prometheus-compatible metrics endpoint.
-
-    Returns metrics for monitoring shadow deployment performance.
-    """
-    # Read shadow logs for metrics
+    """Prometheus-compatible metrics."""
     try:
-        if SHADOW_LOG_FILE.exists():
-            with open(SHADOW_LOG_FILE, "r") as f:
-                logs = json.load(f)
+        if config.SHADOW_LOG_FILE.exists():
+            async with aiofiles.open(config.SHADOW_LOG_FILE, "r") as f:
+                logs = json.loads(await f.read() or "[]")
         else:
             logs = []
     except Exception:
         logs = []
-
-    total_predictions = len(logs)
-    matching_predictions = sum(
-        1 for log in logs if log.get("comparison", {}).get("prediction_match", False)
-    )
-    avg_prob_diff = (
-        sum(log.get("comparison", {}).get("probability_diff", 0) for log in logs) / total_predictions
-        if total_predictions > 0
-        else 0
-    )
-
+    
+    total = len(logs)
+    matches = sum(1 for l in logs if l.get("comparison", {}).get("prediction_match", False))
+    
     return {
-        "shadow_deployment_metrics": {
-            "total_shadow_predictions": total_predictions,
-            "matching_predictions": matching_predictions,
-            "match_rate": matching_predictions / total_predictions if total_predictions > 0 else 0,
-            "average_probability_difference": avg_prob_diff,
-            "champion_model_version": champion_model.version if champion_model else "unknown",
-            "challenger_model_version": challenger_model.version if challenger_model else "unknown",
+        "shadow_metrics": {
+            "total_predictions": total,
+            "matching_predictions": matches,
+            "match_rate": round(matches / total, 4) if total else 0,
+            "champion_version": champion_model.version if champion_model else "unknown",
+            "challenger_version": challenger_model.version if challenger_model else "unknown",
         },
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/shadow/logs", tags=["Shadow Deployment"])
-async def get_shadow_logs(limit: int = 100):
-    """
-    Retrieve recent shadow deployment logs for analysis.
-
-    Args:
-        limit: Maximum number of log entries to return (default: 100)
-
-    Returns:
-        Recent shadow prediction logs
-    """
+async def get_shadow_logs(
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    """Get shadow prediction logs."""
     try:
-        if SHADOW_LOG_FILE.exists():
-            with open(SHADOW_LOG_FILE, "r") as f:
-                logs = json.load(f)
-            return {"logs": logs[-limit:], "total_count": len(logs)}
-        return {"logs": [], "total_count": 0}
+        if config.SHADOW_LOG_FILE.exists():
+            async with aiofiles.open(config.SHADOW_LOG_FILE, "r") as f:
+                logs = json.loads(await f.read() or "[]")
+            return {"logs": logs[-limit:], "total": len(logs)}
+        return {"logs": [], "total": 0}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read logs: {e}")
+        raise HTTPException(500, str(e))
 
 
 @app.get("/shadow/comparison", tags=["Shadow Deployment"])
 async def get_shadow_comparison():
-    """
-    Get comparison summary between Champion and Challenger models.
-
-    Returns aggregated statistics for shadow deployment analysis.
-    """
+    """Get model comparison summary."""
     try:
-        if not SHADOW_LOG_FILE.exists():
-            return {
-                "message": "No shadow logs available yet",
-                "recommendation": "Send predictions to generate comparison data",
-            }
-
-        with open(SHADOW_LOG_FILE, "r") as f:
-            logs = json.load(f)
-
+        if not config.SHADOW_LOG_FILE.exists():
+            return {"status": "no_data", "message": "No logs yet"}
+        
+        async with aiofiles.open(config.SHADOW_LOG_FILE, "r") as f:
+            logs = json.loads(await f.read() or "[]")
+        
         if not logs:
-            return {"message": "No shadow logs available yet"}
-
-        # Calculate statistics
+            return {"status": "no_data"}
+        
         total = len(logs)
-        matches = sum(1 for log in logs if log["comparison"]["prediction_match"])
-        prob_diffs = [log["comparison"]["probability_diff"] for log in logs]
-
-        champion_latencies = [log["champion"]["latency_ms"] for log in logs]
-        challenger_latencies = [log["challenger"]["latency_ms"] for log in logs]
-
+        matches = sum(1 for l in logs if l["comparison"]["prediction_match"])
+        diffs = [l["comparison"]["probability_diff"] for l in logs]
+        rate = matches / total
+        
         return {
             "summary": {
-                "total_comparisons": total,
-                "prediction_agreement_rate": matches / total,
-                "prediction_disagreements": total - matches,
+                "total": total,
+                "agreement_rate": round(rate, 4),
+                "agreements": matches,
+                "disagreements": total - matches,
             },
-            "probability_difference": {
-                "mean": sum(prob_diffs) / total,
-                "max": max(prob_diffs),
-                "min": min(prob_diffs),
+            "probability_diff": {
+                "mean": round(sum(diffs) / total, 4),
+                "max": round(max(diffs), 4),
+                "min": round(min(diffs), 4),
             },
-            "latency_comparison": {
-                "champion_avg_ms": sum(champion_latencies) / total,
-                "challenger_avg_ms": sum(challenger_latencies) / total,
-            },
-            "recommendation": (
-                "Challenger ready for promotion"
-                if matches / total > 0.95
-                else "Continue monitoring - prediction agreement below threshold"
-            ),
-            "timestamp": datetime.utcnow().isoformat(),
+            "recommendation": "PROMOTE" if rate > 0.95 else "MONITOR",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate comparison: {e}")
-
-
-# =============================================================================
-# ERROR HANDLERS
-# =============================================================================
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler for unhandled errors."""
-    logger.error(f"Unhandled error: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "message": "An unexpected error occurred. Please try again later.",
-            "timestamp": datetime.utcnow().isoformat(),
-        },
-    )
+        raise HTTPException(500, str(e))
 
 
 # =============================================================================
@@ -643,11 +922,4 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        "src.api:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info",
-    )
+    uvicorn.run("src.api:app", host="0.0.0.0", port=8000, reload=True)

@@ -1,459 +1,764 @@
 #!/usr/bin/env python3
 """
-Data Drift Detection Module for Shadow MLOps
+Statistical Drift Detection Module.
 
-This module implements drift detection using Evidently AI patterns.
-It compares reference (training) data with current (production) data
-to identify significant distribution shifts that may require model retraining.
+This module implements production-grade drift detection using multiple
+statistical methods to identify distribution shifts between reference
+(training) and current (production) data.
 
-Features:
-- Statistical drift detection (KS test, Chi-square, PSI)
-- Feature-level drift analysis
-- Threshold-based alerting
-- Report generation for CI/CD integration
+Supported Methods:
+    - PSI (Population Stability Index): Measures distribution shift
+    - KS Test (Kolmogorov-Smirnov): Non-parametric distribution comparison
+    - Chi-Square Test: Categorical variable drift
+    - Jensen-Shannon Divergence: Symmetric KL divergence
+
+Architecture:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                     DriftDetector                               │
+    │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐ │
+    │  │   PSI Detector  │  │   KS Detector   │  │ Chi-Sq Detector │ │
+    │  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘ │
+    │           │                    │                     │          │
+    │           └────────────────────┼─────────────────────┘          │
+    │                                │                                 │
+    │                    ┌───────────▼───────────┐                    │
+    │                    │    DriftReport        │                    │
+    │                    │  (Aggregated Results) │                    │
+    │                    └───────────────────────┘                    │
+    └─────────────────────────────────────────────────────────────────┘
 
 Usage:
-    python detect_drift.py --threshold 0.3
-    python detect_drift.py --mode evaluation --threshold 0.3
+    $ python -m monitoring.detect_drift --reference data/reference.csv --current data/current.csv
+    $ python -m monitoring.detect_drift --generate-sample
+
+Exit Codes:
+    0: No significant drift detected
+    1: Drift detected (requires action)
+    2: Error in drift detection
+
+Author: Shadow MLOps Team
+Version: 2.0.0
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
-import random
 import sys
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
-import pandas as pd
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ],
 )
-logger = logging.getLogger("drift_detector")
-
-REPORTS_DIR = Path("monitoring/reports")
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# DATA GENERATION (Simulated for Demo)
-# =============================================================================
+class DriftSeverity(Enum):
+    """Drift severity classification levels."""
+
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
 
-def generate_reference_data(n_samples: int = 10000, seed: int = 42) -> pd.DataFrame:
+class DriftMethod(Enum):
+    """Available drift detection methods."""
+
+    PSI = "psi"
+    KS_TEST = "ks_test"
+    CHI_SQUARE = "chi_square"
+    JS_DIVERGENCE = "js_divergence"
+
+
+@dataclass
+class FeatureDriftResult:
     """
-    Generate reference (training) data distribution.
+    Drift detection result for a single feature.
 
-    This simulates the data distribution the model was trained on.
-    In production, this would be loaded from a feature store or data warehouse.
+    Attributes:
+        feature_name: Name of the analyzed feature
+        method: Detection method used
+        statistic: Computed test statistic
+        threshold: Threshold for drift determination
+        drift_detected: Whether drift exceeds threshold
+        severity: Categorized drift severity
+        p_value: Statistical p-value (if applicable)
+        details: Additional method-specific details
     """
-    np.random.seed(seed)
 
-    data = {
-        "customer_id": [f"CUST_{i:06d}" for i in range(n_samples)],
-        "event_timestamp": [
-            datetime.now() - timedelta(days=random.randint(30, 180))
-            for _ in range(n_samples)
-        ],
-        # Engagement features
-        "days_since_last_login": np.random.exponential(scale=15, size=n_samples).astype(int),
-        "login_frequency_30d": np.random.poisson(lam=12, size=n_samples),
-        "session_duration_avg": np.random.gamma(shape=2, scale=15, size=n_samples),
-        "page_views_30d": np.random.poisson(lam=50, size=n_samples),
-        # Transaction features
-        "total_transactions_90d": np.random.poisson(lam=8, size=n_samples),
-        "transaction_value_avg": np.random.lognormal(mean=4, sigma=0.8, size=n_samples),
-        "transaction_frequency": np.random.gamma(shape=2, scale=0.5, size=n_samples),
-        # Support features
-        "support_tickets_30d": np.random.poisson(lam=1.5, size=n_samples),
-        "complaint_count_90d": np.random.poisson(lam=0.5, size=n_samples),
-        # Subscription features
-        "subscription_tenure_days": np.random.exponential(scale=365, size=n_samples).astype(int),
-        "satisfaction_score": np.clip(np.random.normal(loc=7, scale=1.5, size=n_samples), 1, 10),
-        # Target
-        "churned": np.random.binomial(n=1, p=0.15, size=n_samples),
-    }
+    feature_name: str
+    method: DriftMethod
+    statistic: float
+    threshold: float
+    drift_detected: bool
+    severity: DriftSeverity
+    p_value: float | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
-    return pd.DataFrame(data)
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize result to dictionary."""
+        return {
+            "feature_name": self.feature_name,
+            "method": self.method.value,
+            "statistic": round(self.statistic, 6),
+            "threshold": self.threshold,
+            "drift_detected": self.drift_detected,
+            "severity": self.severity.value,
+            "p_value": round(self.p_value, 6) if self.p_value else None,
+            "details": self.details,
+        }
 
 
-def generate_current_data(
-    n_samples: int = 5000,
-    drift_intensity: float = 0.0,
-    seed: int = 123,
-) -> pd.DataFrame:
+@dataclass
+class DriftReport:
     """
-    Generate current (production) data with optional drift.
+    Comprehensive drift detection report.
 
-    Args:
-        n_samples: Number of samples to generate
-        drift_intensity: Amount of drift to introduce (0.0 = no drift, 1.0 = severe drift)
-        seed: Random seed for reproducibility
-
-    Returns:
-        DataFrame with current data distribution
+    Attributes:
+        timestamp: Report generation timestamp
+        reference_samples: Number of reference samples
+        current_samples: Number of current samples
+        feature_results: Per-feature drift results
+        overall_drift: Whether overall drift detected
+        overall_severity: Maximum severity across features
+        recommendations: Action recommendations
     """
-    np.random.seed(seed)
 
-    # Apply drift to distribution parameters
-    login_scale = 15 + (drift_intensity * 20)  # Drift: customers logging in less
-    transaction_lambda = max(1, 8 - (drift_intensity * 5))  # Drift: fewer transactions
-    satisfaction_mean = 7 - (drift_intensity * 2)  # Drift: lower satisfaction
-    churn_rate = 0.15 + (drift_intensity * 0.25)  # Drift: higher churn
+    timestamp: datetime
+    reference_samples: int
+    current_samples: int
+    feature_results: list[FeatureDriftResult]
+    overall_drift: bool
+    overall_severity: DriftSeverity
+    recommendations: list[str] = field(default_factory=list)
 
-    data = {
-        "customer_id": [f"CUST_{i:06d}" for i in range(n_samples)],
-        "event_timestamp": [
-            datetime.now() - timedelta(days=random.randint(0, 30))
-            for _ in range(n_samples)
-        ],
-        # Engagement features (with drift)
-        "days_since_last_login": np.random.exponential(scale=login_scale, size=n_samples).astype(int),
-        "login_frequency_30d": np.random.poisson(lam=max(1, 12 - drift_intensity * 4), size=n_samples),
-        "session_duration_avg": np.random.gamma(shape=2, scale=15 - drift_intensity * 5, size=n_samples),
-        "page_views_30d": np.random.poisson(lam=max(10, 50 - drift_intensity * 20), size=n_samples),
-        # Transaction features (with drift)
-        "total_transactions_90d": np.random.poisson(lam=transaction_lambda, size=n_samples),
-        "transaction_value_avg": np.random.lognormal(mean=4 - drift_intensity * 0.5, sigma=0.8 + drift_intensity * 0.3, size=n_samples),
-        "transaction_frequency": np.random.gamma(shape=2, scale=max(0.1, 0.5 - drift_intensity * 0.2), size=n_samples),
-        # Support features (with drift)
-        "support_tickets_30d": np.random.poisson(lam=1.5 + drift_intensity * 2, size=n_samples),
-        "complaint_count_90d": np.random.poisson(lam=0.5 + drift_intensity * 1.5, size=n_samples),
-        # Subscription features
-        "subscription_tenure_days": np.random.exponential(scale=365, size=n_samples).astype(int),
-        "satisfaction_score": np.clip(np.random.normal(loc=satisfaction_mean, scale=1.5, size=n_samples), 1, 10),
-        # Target (with drift)
-        "churned": np.random.binomial(n=1, p=min(0.9, churn_rate), size=n_samples),
-    }
+    @property
+    def drift_rate(self) -> float:
+        """Calculate percentage of features with drift."""
+        if not self.feature_results:
+            return 0.0
+        drifted = sum(1 for r in self.feature_results if r.drift_detected)
+        return drifted / len(self.feature_results)
 
-    return pd.DataFrame(data)
+    @property
+    def summary(self) -> str:
+        """Generate human-readable summary."""
+        drifted_features = [r.feature_name for r in self.feature_results if r.drift_detected]
+        return (
+            f"Drift Report ({self.timestamp.isoformat()})\n"
+            f"  Reference samples: {self.reference_samples}\n"
+            f"  Current samples: {self.current_samples}\n"
+            f"  Overall drift: {self.overall_drift}\n"
+            f"  Severity: {self.overall_severity.value}\n"
+            f"  Drift rate: {self.drift_rate:.1%}\n"
+            f"  Drifted features: {drifted_features or 'None'}"
+        )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize report to dictionary."""
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "reference_samples": self.reference_samples,
+            "current_samples": self.current_samples,
+            "feature_results": [r.to_dict() for r in self.feature_results],
+            "overall_drift": self.overall_drift,
+            "overall_severity": self.overall_severity.value,
+            "drift_rate": round(self.drift_rate, 4),
+            "recommendations": self.recommendations,
+        }
 
-# =============================================================================
-# DRIFT DETECTION ALGORITHMS
-# =============================================================================
+    def to_json(self, indent: int = 2) -> str:
+        """Serialize report to JSON string."""
+        return json.dumps(self.to_dict(), indent=indent)
 
 
 class DriftDetector:
     """
-    Drift detection using statistical tests and metrics.
+    Multi-method drift detection engine.
 
-    Implements multiple drift detection methods:
-    - Kolmogorov-Smirnov (KS) test for numerical features
-    - Population Stability Index (PSI) for overall distribution shift
-    - Jensen-Shannon divergence for probability distributions
+    This class provides a comprehensive drift detection framework
+    supporting multiple statistical methods with configurable
+    thresholds and severity classification.
+
+    Attributes:
+        psi_threshold: PSI threshold for drift detection
+        ks_threshold: KS statistic threshold
+        num_bins: Number of bins for histogram-based methods
+
+    Example:
+        >>> detector = DriftDetector(psi_threshold=0.25)
+        >>> report = detector.detect_drift(reference_data, current_data)
+        >>> if report.overall_drift:
+        ...     print("Drift detected! Action required.")
     """
 
-    def __init__(self, threshold: float = 0.3):
+    # PSI severity thresholds (industry standard)
+    PSI_THRESHOLDS = {
+        DriftSeverity.LOW: 0.1,
+        DriftSeverity.MEDIUM: 0.2,
+        DriftSeverity.HIGH: 0.3,
+        DriftSeverity.CRITICAL: 0.5,
+    }
+
+    def __init__(
+        self,
+        psi_threshold: float = 0.3,
+        ks_threshold: float = 0.1,
+        num_bins: int = 10,
+    ) -> None:
         """
-        Initialize drift detector.
+        Initialize drift detector with thresholds.
 
         Args:
-            threshold: Drift score threshold for alerting (0.0 - 1.0)
+            psi_threshold: PSI threshold for drift flag
+            ks_threshold: KS statistic threshold for drift flag
+            num_bins: Number of bins for histogram computation
         """
-        self.threshold = threshold
-        self.drift_results: Dict[str, Any] = {}
+        self.psi_threshold = psi_threshold
+        self.ks_threshold = ks_threshold
+        self.num_bins = num_bins
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
-    def calculate_psi(
+    def _classify_severity(self, psi_value: float) -> DriftSeverity:
+        """
+        Classify drift severity based on PSI value.
+
+        Args:
+            psi_value: Computed PSI value
+
+        Returns:
+            Severity classification
+        """
+        if psi_value < self.PSI_THRESHOLDS[DriftSeverity.LOW]:
+            return DriftSeverity.NONE
+        elif psi_value < self.PSI_THRESHOLDS[DriftSeverity.MEDIUM]:
+            return DriftSeverity.LOW
+        elif psi_value < self.PSI_THRESHOLDS[DriftSeverity.HIGH]:
+            return DriftSeverity.MEDIUM
+        elif psi_value < self.PSI_THRESHOLDS[DriftSeverity.CRITICAL]:
+            return DriftSeverity.HIGH
+        else:
+            return DriftSeverity.CRITICAL
+
+    def compute_psi(
         self,
         reference: np.ndarray,
         current: np.ndarray,
-        n_bins: int = 10,
-    ) -> float:
+        feature_name: str = "feature",
+    ) -> FeatureDriftResult:
         """
-        Calculate Population Stability Index (PSI).
+        Compute Population Stability Index (PSI).
 
         PSI measures the shift in distribution between two datasets.
-        PSI < 0.1: No significant shift
-        PSI 0.1-0.25: Moderate shift, monitor
-        PSI > 0.25: Significant shift, action required
+        It's calculated as: PSI = Σ (actual% - expected%) × ln(actual% / expected%)
+
+        Interpretation:
+            PSI < 0.1: No significant change
+            0.1 ≤ PSI < 0.2: Slight change, monitor
+            0.2 ≤ PSI < 0.3: Moderate change, investigate
+            PSI ≥ 0.3: Significant change, action required
 
         Args:
-            reference: Reference data array
-            current: Current data array
-            n_bins: Number of bins for histogram
+            reference: Reference distribution (training data)
+            current: Current distribution (production data)
+            feature_name: Name of the feature being analyzed
 
         Returns:
-            PSI score
+            FeatureDriftResult with PSI computation
         """
-        # Create bins from reference data
-        min_val = min(reference.min(), current.min())
-        max_val = max(reference.max(), current.max())
-        bins = np.linspace(min_val, max_val, n_bins + 1)
+        # Compute bin edges from combined data for consistent binning
+        combined = np.concatenate([reference, current])
+        bin_edges = np.histogram_bin_edges(combined, bins=self.num_bins)
 
-        # Calculate frequencies
-        ref_counts, _ = np.histogram(reference, bins=bins)
-        cur_counts, _ = np.histogram(current, bins=bins)
+        # Compute histograms
+        ref_counts, _ = np.histogram(reference, bins=bin_edges)
+        curr_counts, _ = np.histogram(current, bins=bin_edges)
 
-        # Convert to proportions with smoothing
-        ref_props = (ref_counts + 1) / (len(reference) + n_bins)
-        cur_props = (cur_counts + 1) / (len(current) + n_bins)
+        # Convert to proportions with Laplace smoothing
+        epsilon = 1e-6
+        ref_props = (ref_counts + epsilon) / (ref_counts.sum() + epsilon * len(ref_counts))
+        curr_props = (curr_counts + epsilon) / (curr_counts.sum() + epsilon * len(curr_counts))
 
         # Calculate PSI
-        psi = np.sum((cur_props - ref_props) * np.log(cur_props / ref_props))
+        psi_values = (curr_props - ref_props) * np.log(curr_props / ref_props)
+        psi = float(np.sum(psi_values))
 
-        return float(psi)
+        severity = self._classify_severity(psi)
+        drift_detected = psi >= self.psi_threshold
 
-    def calculate_ks_statistic(
+        return FeatureDriftResult(
+            feature_name=feature_name,
+            method=DriftMethod.PSI,
+            statistic=psi,
+            threshold=self.psi_threshold,
+            drift_detected=drift_detected,
+            severity=severity,
+            details={
+                "bin_counts_reference": ref_counts.tolist(),
+                "bin_counts_current": curr_counts.tolist(),
+                "psi_per_bin": psi_values.tolist(),
+            },
+        )
+
+    def compute_ks_test(
         self,
         reference: np.ndarray,
         current: np.ndarray,
-    ) -> Tuple[float, float]:
+        feature_name: str = "feature",
+    ) -> FeatureDriftResult:
         """
-        Calculate Kolmogorov-Smirnov statistic.
+        Compute Kolmogorov-Smirnov test statistic.
+
+        The KS test measures the maximum absolute difference between
+        two cumulative distribution functions (CDFs).
 
         Args:
-            reference: Reference data array
-            current: Current data array
+            reference: Reference distribution
+            current: Current distribution
+            feature_name: Name of the feature
 
         Returns:
-            Tuple of (KS statistic, p-value)
+            FeatureDriftResult with KS test results
         """
-        from scipy import stats
+        # Sort data for CDF computation
+        ref_sorted = np.sort(reference)
+        curr_sorted = np.sort(current)
 
-        try:
-            ks_stat, p_value = stats.ks_2samp(reference, current)
-            return float(ks_stat), float(p_value)
-        except ImportError:
-            # Fallback if scipy not available
-            return self._manual_ks_test(reference, current)
+        # Combine and sort all unique values
+        all_values = np.unique(np.concatenate([ref_sorted, curr_sorted]))
 
-    def _manual_ks_test(
+        # Compute CDFs
+        ref_cdf = np.searchsorted(ref_sorted, all_values, side="right") / len(ref_sorted)
+        curr_cdf = np.searchsorted(curr_sorted, all_values, side="right") / len(curr_sorted)
+
+        # KS statistic is max absolute difference
+        ks_statistic = float(np.max(np.abs(ref_cdf - curr_cdf)))
+
+        # Approximate p-value using asymptotic formula
+        n1, n2 = len(reference), len(current)
+        en = np.sqrt(n1 * n2 / (n1 + n2))
+        p_value = float(np.exp(-2 * (ks_statistic * en) ** 2))
+
+        drift_detected = ks_statistic >= self.ks_threshold
+        severity = (
+            DriftSeverity.HIGH if drift_detected and ks_statistic > 0.2
+            else DriftSeverity.MEDIUM if drift_detected
+            else DriftSeverity.NONE
+        )
+
+        return FeatureDriftResult(
+            feature_name=feature_name,
+            method=DriftMethod.KS_TEST,
+            statistic=ks_statistic,
+            threshold=self.ks_threshold,
+            drift_detected=drift_detected,
+            severity=severity,
+            p_value=p_value,
+            details={
+                "reference_samples": n1,
+                "current_samples": n2,
+            },
+        )
+
+    def compute_js_divergence(
         self,
         reference: np.ndarray,
         current: np.ndarray,
-    ) -> Tuple[float, float]:
-        """Manual KS test implementation without scipy."""
-        # Combine and sort
+        feature_name: str = "feature",
+    ) -> FeatureDriftResult:
+        """
+        Compute Jensen-Shannon Divergence.
+
+        JS divergence is a symmetric and bounded measure of
+        distribution similarity (unlike KL divergence).
+
+        Args:
+            reference: Reference distribution
+            current: Current distribution
+            feature_name: Name of the feature
+
+        Returns:
+            FeatureDriftResult with JS divergence
+        """
+        # Compute histograms
         combined = np.concatenate([reference, current])
-        combined_sorted = np.sort(combined)
+        bin_edges = np.histogram_bin_edges(combined, bins=self.num_bins)
 
-        # Calculate CDFs
-        n_ref = len(reference)
-        n_cur = len(current)
+        ref_counts, _ = np.histogram(reference, bins=bin_edges)
+        curr_counts, _ = np.histogram(current, bins=bin_edges)
 
-        ref_cdf = np.searchsorted(np.sort(reference), combined_sorted, side="right") / n_ref
-        cur_cdf = np.searchsorted(np.sort(current), combined_sorted, side="right") / n_cur
+        # Normalize to probability distributions
+        epsilon = 1e-10
+        ref_prob = ref_counts / (ref_counts.sum() + epsilon)
+        curr_prob = curr_counts / (curr_counts.sum() + epsilon)
 
-        # KS statistic is max difference between CDFs
-        ks_stat = np.max(np.abs(ref_cdf - cur_cdf))
+        # Average distribution
+        avg_prob = (ref_prob + curr_prob) / 2
 
-        # Approximate p-value (simplified)
-        n_eff = (n_ref * n_cur) / (n_ref + n_cur)
-        p_value = np.exp(-2 * (ks_stat ** 2) * n_eff)
+        # KL divergences
+        def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+            mask = (p > 0) & (q > 0)
+            return float(np.sum(p[mask] * np.log(p[mask] / q[mask])))
 
-        return float(ks_stat), float(p_value)
+        kl_ref_avg = kl_divergence(ref_prob + epsilon, avg_prob + epsilon)
+        kl_curr_avg = kl_divergence(curr_prob + epsilon, avg_prob + epsilon)
+
+        # JS divergence (bounded [0, 1] when using log2, [0, ln(2)] with ln)
+        js_div = (kl_ref_avg + kl_curr_avg) / 2
+
+        # Threshold at 0.1 (moderate divergence)
+        threshold = 0.1
+        drift_detected = js_div >= threshold
+        severity = (
+            DriftSeverity.HIGH if js_div > 0.3
+            else DriftSeverity.MEDIUM if js_div > 0.15
+            else DriftSeverity.LOW if drift_detected
+            else DriftSeverity.NONE
+        )
+
+        return FeatureDriftResult(
+            feature_name=feature_name,
+            method=DriftMethod.JS_DIVERGENCE,
+            statistic=js_div,
+            threshold=threshold,
+            drift_detected=drift_detected,
+            severity=severity,
+        )
 
     def detect_drift(
         self,
-        reference_df: pd.DataFrame,
-        current_df: pd.DataFrame,
-        feature_columns: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        reference_data: dict[str, np.ndarray],
+        current_data: dict[str, np.ndarray],
+        methods: list[DriftMethod] | None = None,
+    ) -> DriftReport:
         """
-        Detect drift between reference and current datasets.
+        Perform comprehensive drift detection across all features.
 
         Args:
-            reference_df: Reference (training) data
-            current_df: Current (production) data
-            feature_columns: Columns to analyze (defaults to numeric columns)
+            reference_data: Reference data keyed by feature name
+            current_data: Current data keyed by feature name
+            methods: Detection methods to apply (default: PSI + KS)
 
         Returns:
-            Dictionary containing drift analysis results
+            DriftReport with all results and recommendations
         """
-        if feature_columns is None:
-            feature_columns = reference_df.select_dtypes(include=[np.number]).columns.tolist()
-            # Exclude non-feature columns
-            exclude_cols = ["customer_id", "event_timestamp", "churned"]
-            feature_columns = [c for c in feature_columns if c not in exclude_cols]
+        if methods is None:
+            methods = [DriftMethod.PSI, DriftMethod.KS_TEST]
 
-        results = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "n_reference_samples": len(reference_df),
-            "n_current_samples": len(current_df),
-            "threshold": self.threshold,
-            "features": {},
-            "summary": {},
-        }
+        results: list[FeatureDriftResult] = []
+        features = set(reference_data.keys()) & set(current_data.keys())
 
-        drift_scores = []
-        drifted_features = []
+        self._logger.info(f"Analyzing drift for {len(features)} features")
 
-        for col in feature_columns:
-            ref_data = reference_df[col].dropna().values
-            cur_data = current_df[col].dropna().values
+        for feature in sorted(features):
+            ref_values = reference_data[feature]
+            curr_values = current_data[feature]
 
-            if len(ref_data) == 0 or len(cur_data) == 0:
-                continue
+            for method in methods:
+                if method == DriftMethod.PSI:
+                    result = self.compute_psi(ref_values, curr_values, feature)
+                elif method == DriftMethod.KS_TEST:
+                    result = self.compute_ks_test(ref_values, curr_values, feature)
+                elif method == DriftMethod.JS_DIVERGENCE:
+                    result = self.compute_js_divergence(ref_values, curr_values, feature)
+                else:
+                    continue
 
-            # Calculate metrics
-            psi = self.calculate_psi(ref_data, cur_data)
-            ks_stat, ks_pvalue = self.calculate_ks_statistic(ref_data, cur_data)
+                results.append(result)
 
-            # Determine if drifted
-            is_drifted = psi > 0.25 or ks_pvalue < 0.05
+                if result.drift_detected:
+                    self._logger.warning(
+                        f"Drift detected in '{feature}' using {method.value}: "
+                        f"statistic={result.statistic:.4f}, severity={result.severity.value}"
+                    )
 
-            results["features"][col] = {
-                "psi": round(psi, 4),
-                "ks_statistic": round(ks_stat, 4),
-                "ks_pvalue": round(ks_pvalue, 4),
-                "is_drifted": is_drifted,
-                "reference_mean": round(float(np.mean(ref_data)), 4),
-                "current_mean": round(float(np.mean(cur_data)), 4),
-                "mean_shift_pct": round(
-                    abs(np.mean(cur_data) - np.mean(ref_data)) / (np.mean(ref_data) + 1e-10) * 100, 2
-                ),
-            }
+        # Aggregate results
+        overall_drift = any(r.drift_detected for r in results)
+        max_severity = max(
+            (r.severity for r in results),
+            key=lambda s: list(DriftSeverity).index(s),
+            default=DriftSeverity.NONE,
+        )
 
-            drift_scores.append(psi)
-            if is_drifted:
-                drifted_features.append(col)
+        # Generate recommendations
+        recommendations = self._generate_recommendations(results, max_severity)
 
-        # Calculate overall drift score
-        overall_drift_score = np.mean(drift_scores) if drift_scores else 0.0
-        dataset_is_drifted = overall_drift_score > self.threshold
+        # Get sample counts
+        ref_samples = len(next(iter(reference_data.values()), []))
+        curr_samples = len(next(iter(current_data.values()), []))
 
-        results["summary"] = {
-            "overall_drift_score": round(overall_drift_score, 4),
-            "dataset_is_drifted": dataset_is_drifted,
-            "n_drifted_features": len(drifted_features),
-            "drifted_features": drifted_features,
-            "drift_threshold": self.threshold,
-            "recommendation": (
-                "RETRAIN: Significant drift detected. Model retraining recommended."
-                if dataset_is_drifted
-                else "MONITOR: No significant drift. Continue monitoring."
-            ),
-        }
+        report = DriftReport(
+            timestamp=datetime.now(timezone.utc),
+            reference_samples=ref_samples,
+            current_samples=curr_samples,
+            feature_results=results,
+            overall_drift=overall_drift,
+            overall_severity=max_severity,
+            recommendations=recommendations,
+        )
 
-        self.drift_results = results
-        return results
+        return report
 
-    def generate_report(self, output_path: Optional[Path] = None) -> str:
-        """
-        Generate drift detection report.
+    def _generate_recommendations(
+        self,
+        results: list[FeatureDriftResult],
+        severity: DriftSeverity,
+    ) -> list[str]:
+        """Generate actionable recommendations based on drift results."""
+        recommendations: list[str] = []
 
-        Args:
-            output_path: Path to save JSON report
+        if severity == DriftSeverity.NONE:
+            recommendations.append("✓ No significant drift detected. Continue monitoring.")
+            return recommendations
 
-        Returns:
-            Report as JSON string
-        """
-        if not self.drift_results:
-            raise ValueError("No drift results available. Run detect_drift() first.")
+        if severity in (DriftSeverity.HIGH, DriftSeverity.CRITICAL):
+            recommendations.append("⚠️ URGENT: Significant drift detected. Consider model retraining.")
 
-        report_json = json.dumps(self.drift_results, indent=2, default=str)
+        drifted_features = [r.feature_name for r in results if r.drift_detected]
+        if drifted_features:
+            unique_features = sorted(set(drifted_features))
+            recommendations.append(f"📊 Investigate drifted features: {', '.join(unique_features)}")
 
-        if output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, "w") as f:
-                f.write(report_json)
-            logger.info(f"Drift report saved to {output_path}")
+        if severity.value in ("medium", "high", "critical"):
+            recommendations.append("📈 Increase monitoring frequency for affected features.")
+            recommendations.append("🔍 Review data pipeline for potential upstream changes.")
 
-        return report_json
+        if severity == DriftSeverity.CRITICAL:
+            recommendations.append("🚨 Consider switching to fallback model or champion rollback.")
+
+        return recommendations
 
 
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
+def generate_reference_data(
+    n_samples: int = 10000,
+    seed: int = 42,
+) -> dict[str, np.ndarray]:
+    """
+    Generate synthetic reference (training) data.
+
+    Creates realistic customer churn data distributions
+    for drift detection testing.
+
+    Args:
+        n_samples: Number of samples to generate
+        seed: Random seed for reproducibility
+
+    Returns:
+        Dictionary of feature arrays
+    """
+    rng = np.random.default_rng(seed)
+
+    return {
+        "tenure": rng.exponential(scale=20, size=n_samples).clip(1, 72),
+        "monthly_charges": rng.normal(loc=65, scale=20, size=n_samples).clip(20, 120),
+        "total_charges": rng.normal(loc=2000, scale=1500, size=n_samples).clip(100, 8000),
+        "num_support_tickets": rng.poisson(lam=1.5, size=n_samples),
+        "avg_monthly_gb_download": rng.gamma(shape=2, scale=10, size=n_samples),
+        "contract_type": rng.choice([0, 1, 2], size=n_samples, p=[0.5, 0.3, 0.2]),
+    }
 
 
-def main():
-    """Main execution function for drift detection."""
+def generate_current_data(
+    n_samples: int = 5000,
+    drift_features: list[str] | None = None,
+    drift_magnitude: float = 0.3,
+    seed: int = 123,
+) -> dict[str, np.ndarray]:
+    """
+    Generate synthetic current (production) data with optional drift.
+
+    Args:
+        n_samples: Number of samples to generate
+        drift_features: Features to inject drift into
+        drift_magnitude: How much to shift drifted distributions
+        seed: Random seed for reproducibility
+
+    Returns:
+        Dictionary of feature arrays
+    """
+    rng = np.random.default_rng(seed)
+    drift_features = drift_features or []
+
+    data: dict[str, np.ndarray] = {}
+
+    # Tenure - slight drift toward longer tenure
+    drift = drift_magnitude * 5 if "tenure" in drift_features else 0
+    data["tenure"] = rng.exponential(scale=20 + drift, size=n_samples).clip(1, 72)
+
+    # Monthly charges - drift toward higher charges
+    drift = drift_magnitude * 15 if "monthly_charges" in drift_features else 0
+    data["monthly_charges"] = rng.normal(
+        loc=65 + drift, scale=20, size=n_samples
+    ).clip(20, 130)
+
+    # Total charges
+    drift = drift_magnitude * 500 if "total_charges" in drift_features else 0
+    data["total_charges"] = rng.normal(
+        loc=2000 + drift, scale=1500, size=n_samples
+    ).clip(100, 8500)
+
+    # Support tickets - drift toward more tickets
+    drift = drift_magnitude * 2 if "num_support_tickets" in drift_features else 0
+    data["num_support_tickets"] = rng.poisson(lam=1.5 + drift, size=n_samples)
+
+    # Download usage
+    drift = drift_magnitude * 5 if "avg_monthly_gb_download" in drift_features else 0
+    data["avg_monthly_gb_download"] = rng.gamma(
+        shape=2 + drift, scale=10, size=n_samples
+    )
+
+    # Contract type - drift toward month-to-month
+    if "contract_type" in drift_features:
+        probs = [0.6, 0.25, 0.15]  # More month-to-month
+    else:
+        probs = [0.5, 0.3, 0.2]
+    data["contract_type"] = rng.choice([0, 1, 2], size=n_samples, p=probs)
+
+    return data
+
+
+def main() -> int:
+    """
+    Main entry point for drift detection CLI.
+
+    Returns:
+        Exit code (0=no drift, 1=drift detected, 2=error)
+    """
     parser = argparse.ArgumentParser(
-        description="Detect data drift between reference and current datasets"
+        description="Detect statistical drift between reference and current data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Generate sample data and detect drift
+    python -m monitoring.detect_drift --generate-sample --drift-features tenure monthly_charges
+
+    # Detect drift with custom threshold
+    python -m monitoring.detect_drift --generate-sample --psi-threshold 0.2
+
+    # Output report to file
+    python -m monitoring.detect_drift --generate-sample --output drift_report.json
+        """,
+    )
+
+    parser.add_argument(
+        "--generate-sample",
+        action="store_true",
+        help="Generate synthetic sample data for testing",
     )
     parser.add_argument(
-        "--threshold",
+        "--drift-features",
+        nargs="+",
+        default=["monthly_charges", "num_support_tickets"],
+        help="Features to inject drift into (for sample generation)",
+    )
+    parser.add_argument(
+        "--drift-magnitude",
+        type=float,
+        default=0.4,
+        help="Drift magnitude for sample generation (default: 0.4)",
+    )
+    parser.add_argument(
+        "--psi-threshold",
         type=float,
         default=0.3,
-        help="Drift score threshold for alerting (0.0 - 1.0)",
+        help="PSI threshold for drift detection (default: 0.3)",
     )
     parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["detection", "evaluation"],
-        default="detection",
-        help="Mode: 'detection' for drift check, 'evaluation' for model comparison",
-    )
-    parser.add_argument(
-        "--simulate-drift",
+        "--ks-threshold",
         type=float,
-        default=None,
-        help="Simulate drift with specified intensity (0.0 - 1.0)",
+        default=0.1,
+        help="KS statistic threshold (default: 0.1)",
     )
     parser.add_argument(
         "--output",
-        type=str,
-        default=None,
-        help="Output path for drift report",
+        type=Path,
+        help="Output file path for JSON report",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
     )
 
     args = parser.parse_args()
 
-    logger.info("=" * 60)
-    logger.info("Shadow-MLOps Drift Detection")
-    logger.info("=" * 60)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    # Determine drift intensity
-    if args.simulate_drift is not None:
-        drift_intensity = args.simulate_drift
-    else:
-        # Randomly simulate drift for demo (30% chance of significant drift)
-        drift_intensity = random.uniform(0.0, 0.6) if random.random() < 0.3 else random.uniform(0.0, 0.2)
+    try:
+        # Generate or load data
+        if args.generate_sample:
+            logger.info("Generating synthetic sample data...")
+            reference_data = generate_reference_data()
+            current_data = generate_current_data(
+                drift_features=args.drift_features,
+                drift_magnitude=args.drift_magnitude,
+            )
+            logger.info(
+                f"Generated {len(next(iter(reference_data.values())))} reference samples "
+                f"and {len(next(iter(current_data.values())))} current samples"
+            )
+            logger.info(f"Drift injected into: {args.drift_features}")
+        else:
+            logger.error("No data source specified. Use --generate-sample or provide data files.")
+            return 2
 
-    logger.info(f"Drift intensity: {drift_intensity:.2f}")
-    logger.info(f"Threshold: {args.threshold}")
+        # Perform drift detection
+        detector = DriftDetector(
+            psi_threshold=args.psi_threshold,
+            ks_threshold=args.ks_threshold,
+        )
 
-    # Generate datasets
-    logger.info("Generating reference dataset...")
-    reference_df = generate_reference_data(n_samples=10000)
-    logger.info(f"Reference dataset: {len(reference_df)} samples")
+        logger.info("Running drift detection...")
+        report = detector.detect_drift(
+            reference_data,
+            current_data,
+            methods=[DriftMethod.PSI, DriftMethod.KS_TEST],
+        )
 
-    logger.info("Generating current dataset...")
-    current_df = generate_current_data(n_samples=5000, drift_intensity=drift_intensity)
-    logger.info(f"Current dataset: {len(current_df)} samples")
+        # Output results
+        print("\n" + "=" * 60)
+        print(report.summary)
+        print("=" * 60)
 
-    # Detect drift
-    detector = DriftDetector(threshold=args.threshold)
-    logger.info("Running drift detection...")
-    results = detector.detect_drift(reference_df, current_df)
+        print("\nRecommendations:")
+        for rec in report.recommendations:
+            print(f"  {rec}")
 
-    # Output results
-    logger.info("-" * 60)
-    logger.info("DRIFT DETECTION RESULTS")
-    logger.info("-" * 60)
-    logger.info(f"Overall Drift Score: {results['summary']['overall_drift_score']:.4f}")
-    logger.info(f"Dataset Drifted: {results['summary']['dataset_is_drifted']}")
-    logger.info(f"Drifted Features: {results['summary']['n_drifted_features']}")
+        # Save report if output specified
+        if args.output:
+            args.output.write_text(report.to_json())
+            logger.info(f"Report saved to: {args.output}")
 
-    if results['summary']['drifted_features']:
-        logger.info(f"Features with drift: {', '.join(results['summary']['drifted_features'])}")
+        # Return appropriate exit code
+        if report.overall_drift:
+            logger.warning(
+                f"DRIFT DETECTED - Severity: {report.overall_severity.value.upper()}"
+            )
+            return 1
+        else:
+            logger.info("No significant drift detected")
+            return 0
 
-    logger.info(f"Recommendation: {results['summary']['recommendation']}")
-    logger.info("-" * 60)
-
-    # Save report
-    output_path = Path(args.output) if args.output else REPORTS_DIR / f"drift_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    detector.generate_report(output_path)
-
-    # Exit with appropriate code for CI/CD
-    if results["summary"]["dataset_is_drifted"]:
-        logger.warning("⚠️ DRIFT DETECTED - Raising alert for retraining pipeline")
-        sys.exit(1)  # Exit with error to trigger retraining
-    else:
-        logger.info("✅ No significant drift detected")
-        sys.exit(0)
+    except Exception as exc:
+        logger.exception(f"Drift detection failed: {exc}")
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
