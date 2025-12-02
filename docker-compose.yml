@@ -1,0 +1,112 @@
+# =============================================================================
+# Shadow-MLOps: Docker Compose
+# =============================================================================
+# Multi-service deployment for local development and testing
+
+version: "3.9"
+
+services:
+  # ==========================================================================
+  # Shadow MLOps API
+  # ==========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shadow-mlops-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - FEAST_REPO_PATH=/app/feature_repo
+      - DRIFT_THRESHOLD=0.3
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - shadow-mlops-network
+
+  # ==========================================================================
+  # Prometheus (Metrics Collection)
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: shadow-mlops-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - shadow-mlops-network
+    depends_on:
+      - api
+
+  # ==========================================================================
+  # Grafana (Visualization)
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: shadow-mlops-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=shadow-mlops
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    restart: unless-stopped
+    networks:
+      - shadow-mlops-network
+    depends_on:
+      - prometheus
+
+  # ==========================================================================
+  # Redis (Feature Store Cache - Optional)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: shadow-mlops-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - shadow-mlops-network
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  shadow-mlops-network:
+    driver: bridge
+    name: shadow-mlops-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  prometheus-data:
+    name: shadow-mlops-prometheus
+  grafana-data:
+    name: shadow-mlops-grafana
+  redis-data:
+    name: shadow-mlops-redis

@@ -1,0 +1,97 @@
+# =============================================================================
+# Shadow-MLOps: .gitignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Logs
+logs/
+*.log
+
+# Data files (keep structure, ignore data)
+data/*.parquet
+data/*.csv
+data/*.db
+!data/.gitkeep
+
+# Models (keep structure, ignore models)
+models/*.pkl
+models/*.joblib
+models/*.onnx
+!models/.gitkeep
+
+# Feast artifacts
+feature_repo/.feastignore
+data/registry.db
+data/online_store.db
+
+# MLflow
+mlruns/
+mlflow.db
+
+# Reports
+monitoring/reports/*.json
+monitoring/reports/*.html
+!monitoring/reports/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Secrets
+*.pem
+*.key
+secrets/
